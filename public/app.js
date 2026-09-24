@@ -1,5 +1,6 @@
 const MAX_POST_LENGTH = 280;
 const MAX_SEARCH_LENGTH = 100; // Longer searches are refused by the server.
+const MIN_USER_SEARCH_LENGTH = 3; // "Find people" needs at least this many leading characters.
 const BADGE_POLL_MS = 60 * 1000;
 const app = document.getElementById('app');
 const nav = document.getElementById('nav');
@@ -215,6 +216,18 @@ async function refreshBadge() {
 
 // ---------- Auth view ----------
 
+// Short privacy and retention notice, shown on the sign-up form and the Account page.
+function privacyNotice() {
+  return h('div', { class: 'privacy-notice muted' },
+    h('p', {}, 'Chirp stores your username, a hash of your password, when you joined, and what you post, '
+      + 'like and comment. No email, no tracking, no third parties.'),
+    h('p', {}, 'Posts are seen only by you and your friends. A comment is seen by the post’s author '
+      + 'and by your own friends who can see that post.'),
+    h('p', {}, 'Everything is kept until you delete it or your account. Deleting your account erases it all; '
+      + 'you can download a copy of your data first.'),
+  );
+}
+
 function renderAuth(mode = 'login') {
   startView();
   const isLogin = mode === 'login';
@@ -248,6 +261,7 @@ function renderAuth(mode = 'login') {
     h('div', { class: 'card' },
       h('h2', {}, isLogin ? 'Log in' : 'Sign up'),
       form,
+      !isLogin && privacyNotice(),
       h('p', { class: 'switch muted' },
         isLogin ? 'New here? ' : 'Already have an account? ',
         h('button', { class: 'link', type: 'button', onclick: () => renderAuth(isLogin ? 'signup' : 'login') },
@@ -349,6 +363,10 @@ async function renderComments(container, post, onCountChange) {
       }
     },
   }, input, submit);
+  const note = h('p', { class: 'muted comment-note' },
+    post.mine
+      ? 'You see every comment here; others see only the comments written by their friends.'
+      : `Your comment is seen by @${post.username} and by your friends who can see this post.`);
 
   const deleteButton = (c) => {
     const button = h('button', {
@@ -375,6 +393,7 @@ async function renderComments(container, post, onCountChange) {
     )),
     ...(list.length ? [] : [h('p', { class: 'muted comment-status' }, 'No comments yet.')]),
     form,
+    note,
     error,
   );
 }
@@ -480,12 +499,13 @@ function renderHome() {
 // request) fails with an error instead of doing something else.
 function friendActions(username, relation, onChange) {
   const error = h('span', { class: 'error compact' });
-  const act = (method, intent, label, cls) => {
+  const name = encodeURIComponent(username);
+  const act = (method, url, intent, label, cls) => {
     const button = h('button', {
       class: cls,
       onclick: () => runAction(button, error, async () => {
         try {
-          await api(method, `/api/friends/${encodeURIComponent(username)}`, { intent });
+          await api(method, url, intent ? { intent } : undefined);
         } finally {
           refreshBadge();
         }
@@ -494,14 +514,39 @@ function friendActions(username, relation, onChange) {
     }, label);
     return button;
   };
+  const friends = `/api/friends/${name}`;
 
   switch (relation) {
-    case 'friends': return [act('DELETE', 'unfriend', 'Unfriend', 'danger'), error];
-    case 'outgoing': return [act('DELETE', 'cancel', 'Cancel request', 'secondary'), error];
-    case 'incoming': return [act('POST', 'accept', 'Accept'), act('DELETE', 'decline', 'Decline', 'secondary'), error];
-    case 'none': return [act('POST', 'request', 'Add friend'), error];
+    case 'friends': return [act('DELETE', friends, 'unfriend', 'Unfriend', 'danger'), error];
+    case 'outgoing': return [act('DELETE', friends, 'cancel', 'Cancel request', 'secondary'), error];
+    case 'incoming': return [act('POST', friends, 'accept', 'Accept'), act('DELETE', friends, 'decline', 'Decline', 'secondary'), error];
+    case 'none': return [act('POST', friends, 'request', 'Add friend'), error];
+    case 'blocked': return [act('DELETE', `/api/blocks/${name}`, null, 'Unblock', 'secondary'), error];
     default: return [];
   }
+}
+
+// "Block" button for a profile. Blocking ends any friendship or request, and hides you from them.
+function blockButton(username, onChange) {
+  const button = h('button', {
+    class: 'danger',
+    onclick: () => {
+      if (!confirm(`Block @${username}? This ends any friendship or request between you, and they won’t be able to see your profile, find you or send you requests.`)) return;
+      runAction(button, null, async () => {
+        await api('POST', `/api/blocks/${encodeURIComponent(username)}`);
+        refreshBadge();
+        onChange();
+      });
+    },
+  }, 'Block');
+  return button;
+}
+
+// `joined` is "YYYY-MM" (or null if hidden). Built from parts, so it's the same month in every time zone.
+function joinedText(joined) {
+  if (!joined) return null;
+  const [year, month] = joined.split('-').map(Number);
+  return `Joined ${new Date(year, month - 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}`;
 }
 
 async function renderProfile(username) {
@@ -524,7 +569,11 @@ async function renderProfile(username) {
     friends: 'Friends',
     outgoing: 'Friend request sent',
     incoming: 'Wants to be your friend',
+    declined: 'Declined your friend request',
+    blocked: 'Blocked',
   }[profile.relation];
+  const details = [joinedText(profile.joined), status].filter(Boolean).join(' · ');
+  const canBlock = !['self', 'blocked'].includes(profile.relation);
 
   const list = h('div');
   const children = [
@@ -532,11 +581,12 @@ async function renderProfile(username) {
       h('div', { class: 'profile-head' },
         h('div', {},
           h('h1', {}, `@${profile.username}`),
-          h('p', { class: 'muted', style: 'margin:4px 0 0' },
-            `Joined ${new Date(profile.joined).toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}`,
-            status ? ` · ${status}` : ''),
+          details && h('p', { class: 'muted', style: 'margin:4px 0 0' }, details),
         ),
-        h('div', { class: 'actions' }, friendActions(profile.username, profile.relation, reload)),
+        h('div', { class: 'actions' },
+          friendActions(profile.username, profile.relation, reload),
+          canBlock && blockButton(profile.username, reload),
+          profile.relation === 'self' && h('a', { href: '#/account' }, 'Account & privacy')),
       ),
     ),
   ];
@@ -551,6 +601,8 @@ async function renderProfile(username) {
       fetchPage: (cursor) => api('GET', profileUrl(cursor)),
       emptyText: profile.relation === 'self' ? "You haven't posted yet." : `@${profile.username} hasn't posted yet.`,
     });
+  } else if (profile.relation === 'blocked') {
+    list.replaceChildren(h('p', { class: 'empty' }, `You’ve blocked @${profile.username}.`));
   } else {
     list.replaceChildren(h('p', { class: 'empty' }, `Become friends with @${profile.username} to see their posts.`));
   }
@@ -571,9 +623,9 @@ async function renderFriends() {
   const reload = () => renderFriends();
 
   app.replaceChildren(h('p', { class: 'empty' }, 'Loading…'));
-  let lists, people;
+  let lists;
   try {
-    [lists, people] = await Promise.all([api('GET', '/api/friends'), api('GET', peopleUrl(''))]);
+    lists = await api('GET', '/api/friends');
   } catch (err) {
     if (current()) showLoadError(app, err, reload);
     return;
@@ -597,7 +649,7 @@ async function renderFriends() {
   const showPeople = (page, q) => {
     peopleList.replaceChildren(...(page.users.length
       ? page.users.map(personRow)
-      : [h('p', { class: 'muted', style: 'margin:0' }, q ? `No one matches “${q}”.` : 'No one else to add.')]));
+      : [h('p', { class: 'muted', style: 'margin:0' }, `No one to add whose username starts with “${q}”.`)]));
     appendLoadMore(peopleList, page.nextCursor, async (cursor) => {
       const next = await api('GET', peopleUrl(q, cursor));
       return { items: next.users, nextCursor: next.nextCursor };
@@ -605,10 +657,13 @@ async function renderFriends() {
   };
 
   const findInput = h('input', { type: 'search', maxlength: MAX_SEARCH_LENGTH, placeholder: 'Find people by username…', style: 'margin-bottom:8px' });
+  const searchHint = () => peopleList.replaceChildren(h('p', { class: 'muted', style: 'margin:0' },
+    `Type the first ${MIN_USER_SEARCH_LENGTH} or more letters of their username.`));
   const nextSearch = latestOnly();
   findInput.addEventListener('input', debounce(async () => {
     const isLatest = nextSearch();
     const q = findInput.value.trim();
+    if (q.length < MIN_USER_SEARCH_LENGTH) return searchHint();
     try {
       const page = await api('GET', peopleUrl(q));
       if (isLatest()) showPeople(page, q);
@@ -616,13 +671,74 @@ async function renderFriends() {
       if (isLatest()) peopleList.replaceChildren(h('p', { class: 'error' }, err.message));
     }
   }, 250));
-  showPeople(people, '');
+  searchHint();
 
   app.replaceChildren(
     lists.incoming.length ? section('Friend requests', lists.incoming, 'incoming', '') : '',
     section('Friends', lists.friends, 'friends', 'No friends yet — add some below.'),
     lists.outgoing.length ? section('Sent requests', lists.outgoing, 'outgoing', '') : '',
     h('section', { class: 'card' }, h('h2', {}, 'Find people'), findInput, peopleList),
+  );
+}
+
+// ---------- Account view ----------
+
+async function renderAccount() {
+  const current = startView();
+  const reload = () => renderAccount();
+
+  app.replaceChildren(h('p', { class: 'empty' }, 'Loading…'));
+  let lists;
+  try {
+    lists = await api('GET', '/api/friends');
+  } catch (err) {
+    if (current()) showLoadError(app, err, reload);
+    return;
+  }
+  if (!current()) return;
+
+  const password = h('input', {
+    type: 'password',
+    placeholder: 'Your password',
+    autocomplete: 'current-password',
+    'aria-label': 'Your password',
+    required: true,
+  });
+  const deleteBtn = h('button', { type: 'submit', class: 'danger' }, 'Delete my account');
+  const deleteError = h('p', { class: 'error' });
+  const deleteForm = h('form', {
+    class: 'account-delete',
+    onsubmit: (e) => {
+      e.preventDefault();
+      if (!confirm('Permanently delete your account, posts, comments, likes and friendships? This can’t be undone.')) return;
+      runAction(deleteBtn, deleteError, async () => {
+        await api('DELETE', '/api/me', { password: password.value });
+        me = null;
+        navigate('#/');
+      });
+    },
+  }, password, deleteBtn, deleteError);
+
+  app.replaceChildren(
+    h('section', { class: 'card' }, h('h2', {}, 'Privacy'), privacyNotice()),
+    h('section', { class: 'card' },
+      h('h2', {}, 'Your data'),
+      h('p', { class: 'muted', style: 'margin:0 0 10px' }, 'Download your account details, posts, comments, likes and friendships as a JSON file.'),
+      h('a', { class: 'button secondary', href: '/api/me/export', download: '' }, 'Download my data'),
+    ),
+    h('section', { class: 'card' },
+      h('h2', {}, `Blocked (${lists.blocked.length})`),
+      lists.blocked.length
+        ? lists.blocked.map((name) => h('div', { class: 'user-row' },
+            userLink(name),
+            h('div', { class: 'actions' }, friendActions(name, 'blocked', reload))))
+        : h('p', { class: 'muted', style: 'margin:0' }, 'You haven’t blocked anyone. Use “Block” on a profile.'),
+    ),
+    h('section', { class: 'card' },
+      h('h2', {}, 'Delete account'),
+      h('p', { class: 'muted', style: 'margin:0 0 10px' }, 'This erases your account and everything you’ve posted, including comments on other people’s posts. Enter your password to confirm.'),
+      deleteForm,
+    ),
   );
 }
 
@@ -635,6 +751,7 @@ function render() {
   const profileMatch = route.match(/^\/u\/(.+)$/);
   if (profileMatch) return renderProfile(safeDecode(profileMatch[1]));
   if (route === '/friends') return renderFriends();
+  if (route === '/account') return renderAccount();
   return renderHome();
 }
 
