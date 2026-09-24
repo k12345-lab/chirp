@@ -1,4 +1,5 @@
 const MAX_POST_LENGTH = 280;
+const MAX_SEARCH_LENGTH = 100; // Longer searches are refused by the server.
 const BADGE_POLL_MS = 60 * 1000;
 const app = document.getElementById('app');
 const nav = document.getElementById('nav');
@@ -14,6 +15,8 @@ function h(tag, props = {}, ...children) {
     if (value == null || value === false) continue;
     if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
     else if (key === 'class') el.className = value;
+    // Via CSSOM, since the Content-Security-Policy blocks inline style attributes.
+    else if (key === 'style') el.style.cssText = value;
     else if (key in el && typeof value !== 'string') el[key] = value;
     else el.setAttribute(key, value === true ? '' : value);
   }
@@ -433,7 +436,7 @@ function composeBox(onPosted) {
 function renderHome() {
   const current = startView();
   const list = h('div', {}, h('p', { class: 'empty' }, 'Loading…'));
-  const search = h('input', { type: 'search', class: 'search', placeholder: 'Search posts from you and your friends…' });
+  const search = h('input', { type: 'search', class: 'search', maxlength: MAX_SEARCH_LENGTH, placeholder: 'Search posts from you and your friends…' });
   const nextRequest = latestOnly();
 
   const feedUrl = (term, cursor) => {
@@ -601,7 +604,7 @@ async function renderFriends() {
     }, personRow);
   };
 
-  const findInput = h('input', { type: 'search', placeholder: 'Find people by username…', style: 'margin-bottom:8px' });
+  const findInput = h('input', { type: 'search', maxlength: MAX_SEARCH_LENGTH, placeholder: 'Find people by username…', style: 'margin-bottom:8px' });
   const nextSearch = latestOnly();
   findInput.addEventListener('input', debounce(async () => {
     const isLatest = nextSearch();
