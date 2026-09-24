@@ -20,11 +20,19 @@ if (sessionColumns.some((c) => c.name === 'token')) db.exec('DROP TABLE sessions
 // - 'declined': the addressee said no. The requester can't ask again until the cooldown in
 //   server.js has passed (counted from responded_at); the addressee may still ask them.
 // - 'blocked':  requester blocked addressee. The blocked user can't see or contact the blocker.
+export const FRIENDSHIP_STATUS = Object.freeze({
+  PENDING: 'pending',
+  ACCEPTED: 'accepted',
+  DECLINED: 'declined',
+  BLOCKED: 'blocked',
+});
+const quote = (value) => `'${value}'`;
+
 const FRIENDSHIPS_TABLE = `
   CREATE TABLE IF NOT EXISTS friendships (
     requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     addressee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    status       TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'declined', 'blocked')),
+    status       TEXT NOT NULL CHECK (status IN (${Object.values(FRIENDSHIP_STATUS).map(quote).join(', ')})),
     created_at   TEXT NOT NULL,
     responded_at TEXT,
     PRIMARY KEY (requester_id, addressee_id)
@@ -34,7 +42,7 @@ const FRIENDSHIPS_TABLE = `
 // Older databases only allowed 'pending' and 'accepted'. SQLite can't change a CHECK constraint
 // in place, so copy the rows into a table with the new schema (nothing references friendships).
 const oldFriendships = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'friendships'").get();
-if (oldFriendships && !oldFriendships.sql.includes("'blocked'")) {
+if (oldFriendships && !oldFriendships.sql.includes(quote(FRIENDSHIP_STATUS.BLOCKED))) {
   db.exec('BEGIN');
   try {
     db.exec(FRIENDSHIPS_TABLE.replace('friendships', 'friendships_new'));
@@ -115,4 +123,5 @@ function hourlyCleanup() {
   checkpoint();
 }
 hourlyCleanup();
-setInterval(hourlyCleanup, 60 * 60 * 1000).unref();
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // One hour.
+setInterval(hourlyCleanup, CLEANUP_INTERVAL_MS).unref();

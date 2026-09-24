@@ -1,10 +1,10 @@
-const MAX_POST_LENGTH = 280;
-const MAX_SEARCH_LENGTH = 100; // Longer searches are refused by the server.
-const MIN_USER_SEARCH_LENGTH = 3; // "Find people" needs at least this many leading characters.
-// Signup rules, matching the server's checks (it has the final say).
-const USERNAME_PATTERN = '[A-Za-z0-9_]{3,20}';
-const MIN_PASSWORD_LENGTH = 8;
-const MAX_PASSWORD_LENGTH = 200;
+// Limits and names shared with the server, which enforces them, loaded from GET /api/config at
+// startup (see loadConfig): maxPostLength, maxCommentLength, maxSearchLength, minUserSearchLength,
+// min/maxUsernameLength, usernamePattern, min/maxPasswordLength and declineCooldownDays.
+const CONFIG = {};
+// How the current user relates to another user (e.g. RELATION.FRIENDS is 'friends'), as the
+// server sends it in `relation`. Also loaded from /api/config.
+const RELATION = {};
 const BADGE_POLL_MS = 60 * 1000;
 const CLOCK_TICK_MS = 60 * 1000; // How often relative times like "5m" are refreshed.
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
@@ -25,8 +25,6 @@ function h(tag, props = {}, ...children) {
     if (value == null || value === false) continue;
     if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
     else if (key === 'class') el.className = value;
-    // Via CSSOM, since the Content-Security-Policy blocks inline style attributes.
-    else if (key === 'style') el.style.cssText = value;
     else if (key in el && typeof value !== 'string') el[key] = value;
     else el.setAttribute(key, value === true ? '' : value);
   }
@@ -122,6 +120,27 @@ async function runAction(button, errorEl, fn) {
   }
 }
 
+// runAction, but only once the user confirms `question` (if there is one).
+function confirmAction(question, button, errorEl, fn) {
+  if (question && !confirm(question)) return;
+  runAction(button, errorEl, fn);
+}
+
+// A form that runs `onSubmit` through runAction (so `submit` is disabled meanwhile and errors
+// appear in `error`). `validate()` runs first and can return false to stop; `onSettled()` runs
+// after `onSubmit`, whether or not it succeeded.
+function asyncForm(props, { submit, error, validate, onSubmit, onSettled }, ...children) {
+  return h('form', {
+    ...props,
+    onsubmit: async (e) => {
+      e.preventDefault();
+      if (validate && !validate()) return;
+      await runAction(submit, error, onSubmit);
+      onSettled?.();
+    },
+  }, ...children);
+}
+
 // Replace `container` with a "Couldn't load" message and, unless it's a 404, a Retry button.
 // A 404 (e.g. "User not found") offers a way back instead.
 function showLoadError(container, err, retry) {
@@ -195,25 +214,25 @@ function timestamp(iso) {
   }, time, spoken);
 }
 
-// A character counter for `field`, counting the trimmed text as the server does. update()
-// refreshes it and returns { length, over }. Going over the limit is spelled out in the
+// A character counter for `field` with limit `max`, counting the trimmed text as the server does.
+// update() refreshes it and returns { length, over }. Going over the limit is spelled out in the
 // counter's text (not shown by colour alone), marks the field invalid, and is announced.
-function lengthCounter(field) {
+function lengthCounter(field, max) {
   const counter = h('span', { class: 'counter', id: newId('counter') });
   let wasOver = false;
   const update = () => {
     const length = field.value.trim().length;
-    const excess = length - MAX_POST_LENGTH;
+    const excess = length - max;
     const over = excess > 0;
     counter.textContent = over
-      ? `${length} / ${MAX_POST_LENGTH} · ${excess} over the limit`
-      : `${length} / ${MAX_POST_LENGTH}`;
+      ? `${length} / ${max} · ${excess} over the limit`
+      : `${length} / ${max}`;
     counter.classList.toggle('over', over);
     if (over) field.setAttribute('aria-invalid', 'true');
     else field.removeAttribute('aria-invalid');
     if (over !== wasOver) {
       wasOver = over;
-      announce(over ? `Over the ${MAX_POST_LENGTH}-character limit.` : 'Back within the character limit.');
+      announce(over ? `Over the ${max}-character limit.` : 'Back within the character limit.');
     }
     return { length, over };
   };
@@ -249,7 +268,24 @@ function safeDecode(text) {
   }
 }
 
-const userLink = (username) => h('a', { href: `#/u/${encodeURIComponent(username)}` }, username);
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+// `path` plus a query string made of the non-empty `params`.
+function apiUrl(path, params = {}) {
+  const query = new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString();
+  return query ? `${path}?${query}` : path;
+}
+
+const profileHref = (username) => `#/u/${encodeURIComponent(username)}`;
+
+const userLink = (username, label = username, cls = null) =>
+  h('a', { href: profileHref(username), class: cls }, label);
+
+// The heading line of a post or comment: "@author", when it was written, and any `extra` (buttons).
+const authorLine = (username, createdAt, ...extra) => h('div', { class: 'meta-head' },
+  userLink(username, `@${username}`, 'author'),
+  timestamp(createdAt),
+  ...extra);
 
 // A row in a list of people: their name and `actions` (buttons).
 const userRow = (username, actions) => h('li', { class: 'user-row', 'data-username': username },
@@ -275,6 +311,12 @@ function navigate(hash) {
   focusPending = true;
   if ((location.hash || '#/') === hash) render();
   else location.hash = hash;
+}
+
+// After logging out (or deleting the account), show the login form.
+function loggedOut() {
+  me = null;
+  navigate('#/');
 }
 
 // ---------- Nav ----------
@@ -307,12 +349,11 @@ function renderNav() {
     'data-key': 'logout',
     onclick: () => runAction(logout, null, async () => {
       await api('POST', '/api/logout');
-      me = null;
-      navigate('#/');
+      loggedOut();
     }),
   }, 'Log out');
 
-  const profileLink = link(`#/u/${encodeURIComponent(me.username)}`, `@${me.username}`, null, ' nav-user');
+  const profileLink = link(profileHref(me.username), `@${me.username}`, null, ' nav-user');
   profileLink.title = `@${me.username}`; // The name may be cut short on small screens.
 
   nav.hidden = false;
@@ -371,6 +412,7 @@ function renderAuth(mode = 'login') {
   startView();
   focusPending = false; // The username field gets focus instead.
   const isLogin = mode === 'login';
+  const usernameLengths = `${CONFIG.minUsernameLength}–${CONFIG.maxUsernameLength}`;
   setTitle(isLogin ? 'Log in' : 'Sign up');
   const error = h('p', { class: 'error', role: 'alert', id: newId('error') });
 
@@ -381,14 +423,19 @@ function renderAuth(mode = 'login') {
     spellcheck: 'false',
     required: true,
     // Signup checks the rules up front; login accepts whatever an existing account has.
-    ...(isLogin ? {} : { minlength: 3, maxlength: 20, pattern: USERNAME_PATTERN, title: '3–20 letters, numbers or underscores' }),
+    ...(isLogin ? {} : {
+      minlength: CONFIG.minUsernameLength,
+      maxlength: CONFIG.maxUsernameLength,
+      pattern: CONFIG.usernamePattern,
+      title: `${usernameLengths} letters, numbers or underscores`,
+    }),
   });
   const password = h('input', {
     name: 'password',
     type: 'password',
     autocomplete: isLogin ? 'current-password' : 'new-password',
     required: true,
-    ...(isLogin ? {} : { minlength: MIN_PASSWORD_LENGTH, maxlength: MAX_PASSWORD_LENGTH }),
+    ...(isLogin ? {} : { minlength: CONFIG.minPasswordLength, maxlength: CONFIG.maxPasswordLength }),
   });
 
   // A labelled field with an optional hint; the hint and the form's error describe the input.
@@ -418,27 +465,26 @@ function renderAuth(mode = 'login') {
     fields[0]?.focus();
   };
 
-  const form = h('form', {
-    onsubmit: (e) => {
-      e.preventDefault();
-      runAction(submit, error, async () => {
-        try {
-          await api('POST', isLogin ? '/api/login' : '/api/signup', {
-            username: username.value,
-            password: password.value,
-          });
-        } catch (err) {
-          markInvalid(err.message);
-          throw err;
-        }
-        await refreshMe();
-        focusPending = true;
-        render(); // Keep the current hash, so a deep link like #/friends survives logging in.
-      });
+  const form = asyncForm({}, {
+    submit,
+    error,
+    onSubmit: async () => {
+      try {
+        await api('POST', isLogin ? '/api/login' : '/api/signup', {
+          username: username.value,
+          password: password.value,
+        });
+      } catch (err) {
+        markInvalid(err.message);
+        throw err;
+      }
+      await refreshMe();
+      focusPending = true;
+      render(); // Keep the current hash, so a deep link like #/friends survives logging in.
     },
   },
-  field('Username', username, !isLogin && '3–20 characters: letters, numbers and _'),
-  field('Password', password, !isLogin && `At least ${MIN_PASSWORD_LENGTH} characters.`,
+  field('Username', username, !isLogin && `${usernameLengths} characters: letters, numbers and _`),
+  field('Password', password, !isLogin && `At least ${CONFIG.minPasswordLength} characters.`,
     h('label', { class: 'checkbox' }, showPassword, 'Show password')),
   submit,
   error);
@@ -465,7 +511,6 @@ function renderAuth(mode = 'login') {
 // `onDeleted(card)` is called after the post was deleted, to take its card out of the list.
 function renderPost(post, { searchTerm, onDeleted }) {
   const error = h('p', { class: 'error compact', role: 'alert' });
-  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
   // The emoji is hidden from screen readers, which get "Like (3 likes)" plus the pressed state.
   const likeLabel = () => `Like (${plural(post.likeCount, 'like')})`;
@@ -510,21 +555,15 @@ function renderPost(post, { searchTerm, onDeleted }) {
   const deleteBtn = post.mine && h('button', {
     class: 'link',
     'aria-label': 'Delete post',
-    onclick: () => {
-      if (!confirm('Delete this post?')) return;
-      runAction(deleteBtn, error, async () => {
-        await api('DELETE', `/api/posts/${post.id}`);
-        onDeleted(card);
-      });
-    },
+    onclick: () => confirmAction('Delete this post?', deleteBtn, error, async () => {
+      await api('DELETE', `/api/posts/${post.id}`);
+      onDeleted(card);
+    }),
   }, 'Delete');
 
   const card = h('article', { class: 'card' },
-    h('div', { class: 'post-head' },
-      h('a', { class: 'author', href: `#/u/${encodeURIComponent(post.username)}` }, `@${post.username}`),
-      timestamp(post.createdAt),
-    ),
-    h('p', { class: 'post-body' }, highlight(post.body, searchTerm)),
+    authorLine(post.username, post.createdAt),
+    h('p', { class: 'user-text post-body' }, highlight(post.body, searchTerm)),
     h('div', { class: 'post-actions' }, likeBtn, commentBtn, deleteBtn),
     error,
     comments,
@@ -533,8 +572,9 @@ function renderPost(post, { searchTerm, onDeleted }) {
 }
 
 // Load and show the comment thread for `post` inside `container`, with a reply box.
-// `onCountChange` is called whenever post.commentCount changes.
-async function renderComments(container, post, onCountChange) {
+// `onCountChange` is called whenever post.commentCount changes. `focusReply` puts focus in the
+// reply box once it's shown.
+async function renderComments(container, post, onCountChange, { focusReply = false } = {}) {
   container.replaceChildren(h('p', { class: 'muted comment-status', role: 'status' }, 'Loading comments…'));
   let list;
   try {
@@ -543,7 +583,7 @@ async function renderComments(container, post, onCountChange) {
     container.replaceChildren(h('p', { class: 'error', role: 'alert' }, err.message));
     return;
   }
-  const reload = () => renderComments(container, post, onCountChange);
+  const reload = (options) => renderComments(container, post, onCountChange, options);
   if (post.commentCount !== list.length) {
     post.commentCount = list.length;
     onCountChange();
@@ -551,30 +591,28 @@ async function renderComments(container, post, onCountChange) {
 
   const error = h('p', { class: 'error', role: 'alert', id: newId('error') });
   const input = h('input', { id: newId('comment'), placeholder: 'Write a comment…', autocomplete: 'off' });
-  const { counter, update } = lengthCounter(input);
+  const { counter, update } = lengthCounter(input, CONFIG.maxCommentLength);
   input.setAttribute('aria-describedby', `${counter.id} ${error.id}`);
   input.addEventListener('input', () => {
     update();
     if (input.value.trim()) error.textContent = '';
   });
   const submit = h('button', { type: 'submit' }, 'Reply');
-  const form = h('form', {
-    class: 'comment-form',
-    onsubmit: (e) => {
-      e.preventDefault();
+  const form = asyncForm({ class: 'comment-form' }, {
+    submit,
+    error,
+    validate: () => {
       const { length, over } = update();
-      if (!length || over) {
-        error.textContent = length ? `Comments are limited to ${MAX_POST_LENGTH} characters.` : 'Write a comment first.';
-        input.setAttribute('aria-invalid', 'true');
-        input.focus();
-        return;
-      }
-      runAction(submit, error, async () => {
-        await api('POST', `/api/posts/${post.id}/comments`, { body: input.value });
-        announce('Comment added.');
-        await reload();
-        container.querySelector('.comment-form input')?.focus();
-      });
+      if (length && !over) return true;
+      error.textContent = length ? `Comments are limited to ${CONFIG.maxCommentLength} characters.` : 'Write a comment first.';
+      input.setAttribute('aria-invalid', 'true');
+      input.focus();
+      return false;
+    },
+    onSubmit: async () => {
+      await api('POST', `/api/posts/${post.id}/comments`, { body: input.value });
+      announce('Comment added.');
+      await reload({ focusReply: true });
     },
   }, h('label', { for: input.id, class: 'visually-hidden' }, 'Write a comment'), input, submit);
   const note = h('p', { class: 'muted comment-note' },
@@ -590,22 +628,19 @@ async function renderComments(container, post, onCountChange) {
     const button = h('button', {
       class: 'link comment-delete',
       'aria-label': 'Delete comment',
-      onclick: () => {
-        if (!confirm('Delete this comment?')) return;
-        runAction(button, error, async () => {
-          await api('DELETE', `/api/comments/${c.id}`);
-          const next = item.nextElementSibling ?? item.previousElementSibling;
-          item.remove();
-          post.commentCount = Math.max(0, post.commentCount - 1);
-          onCountChange();
-          if (!listEl.children.length) {
-            listEl.hidden = true;
-            none.hidden = false;
-          }
-          announce('Comment deleted.');
-          focusElement(next?.querySelector('a[href], button') ?? input);
-        });
-      },
+      onclick: () => confirmAction('Delete this comment?', button, error, async () => {
+        await api('DELETE', `/api/comments/${c.id}`);
+        const next = item.nextElementSibling ?? item.previousElementSibling;
+        item.remove();
+        post.commentCount = Math.max(0, post.commentCount - 1);
+        onCountChange();
+        if (!listEl.children.length) {
+          listEl.hidden = true;
+          none.hidden = false;
+        }
+        announce('Comment deleted.');
+        focusElement(next?.querySelector('a[href], button') ?? input);
+      }),
     }, 'Delete');
     return button;
   };
@@ -613,17 +648,14 @@ async function renderComments(container, post, onCountChange) {
   for (const c of list) {
     const item = h('li', { class: 'comment' });
     item.append(
-      h('div', { class: 'post-head' },
-        h('a', { class: 'author', href: `#/u/${encodeURIComponent(c.username)}` }, `@${c.username}`),
-        timestamp(c.createdAt),
-        c.canDelete && deleteButton(c, item),
-      ),
-      h('p', { class: 'comment-body' }, c.body),
+      authorLine(c.username, c.createdAt, c.canDelete && deleteButton(c, item)),
+      h('p', { class: 'user-text comment-body' }, c.body),
     );
     listEl.append(item);
   }
 
   container.replaceChildren(listEl, none, form, h('div', { class: 'comment-meta' }, counter), note, error);
+  if (focusReply) input.focus();
 }
 
 // Show the first page of posts; `opts.fetchPage(cursor)` loads later pages ({ posts, nextCursor }).
@@ -655,7 +687,7 @@ function renderPostList(container, { posts, nextCursor }, opts) {
 function composeBox(onPosted) {
   // No maxlength: a long paste stays whole, and the counter says how far over the limit it is.
   const text = h('textarea', { id: newId('compose'), placeholder: "What's happening?" });
-  const { counter, update } = lengthCounter(text);
+  const { counter, update } = lengthCounter(text, CONFIG.maxPostLength);
   const shortcut = h('span', { class: 'hint shortcut-hint', id: newId('hint') },
     `${IS_MAC ? '⌘' : 'Ctrl'}+Enter to post`);
   const submit = h('button', {
@@ -675,24 +707,17 @@ function composeBox(onPosted) {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) form.requestSubmit();
   });
 
-  const form = h('form', {
-    class: 'card',
-    onsubmit: async (e) => {
-      e.preventDefault();
-      if (submit.disabled) return;
-      submit.disabled = true;
-      error.textContent = '';
-      try {
-        await api('POST', '/api/posts', { body: text.value });
-        text.value = '';
-        refresh();
-        announce('Posted.');
-        onPosted();
-      } catch (err) {
-        error.textContent = err.message;
-        refresh();
-      }
+  const form = asyncForm({ class: 'card' }, {
+    submit,
+    error,
+    validate: () => !submit.disabled, // Ctrl+Enter submits even while the button is disabled.
+    onSubmit: async () => {
+      await api('POST', '/api/posts', { body: text.value });
+      text.value = '';
+      announce('Posted.');
+      onPosted();
     },
+    onSettled: refresh, // runAction re-enables the button; disable it again if the box is empty.
   },
   h('label', { for: text.id, class: 'visually-hidden' }, 'Write a post'),
   text,
@@ -708,16 +733,9 @@ function renderHome() {
   setTitle('Home');
   const heading = h('h1', { class: 'view-title' }, 'Home');
   const list = h('div', {}, statusMessage('Loading…'));
-  const search = h('input', { type: 'search', maxlength: MAX_SEARCH_LENGTH, placeholder: 'Search posts from you and your friends…' });
+  const search = h('input', { type: 'search', maxlength: CONFIG.maxSearchLength, placeholder: 'Search posts from you and your friends…' });
   const nextRequest = latestOnly();
-
-  const feedUrl = (term, cursor) => {
-    const params = new URLSearchParams();
-    if (term) params.set('q', term);
-    if (cursor) params.set('cursor', cursor);
-    const query = params.toString();
-    return `/api/feed${query ? `?${query}` : ''}`;
-  };
+  const feedUrl = (term, cursor) => apiUrl('/api/feed', { q: term, cursor });
 
   const load = async () => {
     const isLatest = nextRequest();
@@ -771,45 +789,42 @@ function friendActions(username, relation, onChange) {
       class: cls,
       // Rows of identical buttons need to say whom they're for.
       'aria-label': `${label} @${username}`,
-      onclick: () => {
-        if (confirmText && !confirm(confirmText)) return;
-        runAction(button, error, async () => {
-          let result;
-          try {
-            result = await api(method, url, intent ? { intent } : undefined);
-          } finally {
-            refreshBadge();
-          }
-          announce(result.relation === 'friends' ? `You’re now friends with @${username}.` : done);
-          onChange(result.relation);
-        });
-      },
+      onclick: () => confirmAction(confirmText, button, error, async () => {
+        let result;
+        try {
+          result = await api(method, url, intent ? { intent } : undefined);
+        } finally {
+          refreshBadge();
+        }
+        announce(result.relation === RELATION.FRIENDS ? `You’re now friends with @${username}.` : done);
+        onChange(result.relation);
+      }),
     }, label);
     return button;
   };
   const friends = `/api/friends/${name}`;
 
   switch (relation) {
-    case 'friends': return [act('DELETE', friends, 'unfriend', 'Unfriend', {
+    case RELATION.FRIENDS: return [act('DELETE', friends, 'unfriend', 'Unfriend', {
       cls: 'danger',
       confirmText: `Unfriend @${username}? You’ll no longer see each other’s posts.`,
       done: `Unfriended @${username}.`,
     }), error];
-    case 'outgoing': return [act('DELETE', friends, 'cancel', 'Cancel request', {
+    case RELATION.OUTGOING: return [act('DELETE', friends, 'cancel', 'Cancel request', {
       cls: 'secondary',
       done: `Canceled your friend request to @${username}.`,
     }), error];
-    case 'incoming': return [
+    case RELATION.INCOMING: return [
       act('POST', friends, 'accept', 'Accept', {}),
       act('DELETE', friends, 'decline', 'Decline', {
         cls: 'secondary',
-        confirmText: `Decline @${username}’s friend request? They won’t be able to ask again for 30 days.`,
+        confirmText: `Decline @${username}’s friend request? They won’t be able to ask again for ${plural(CONFIG.declineCooldownDays, 'day')}.`,
         done: `Declined @${username}’s friend request.`,
       }),
       error,
     ];
-    case 'none': return [act('POST', friends, 'request', 'Add friend', { done: `Friend request sent to @${username}.` }), error];
-    case 'blocked': return [act('DELETE', `/api/blocks/${name}`, null, 'Unblock', {
+    case RELATION.NONE: return [act('POST', friends, 'request', 'Add friend', { done: `Friend request sent to @${username}.` }), error];
+    case RELATION.BLOCKED: return [act('DELETE', `/api/blocks/${name}`, null, 'Unblock', {
       cls: 'secondary',
       done: `Unblocked @${username}.`,
     }), error];
@@ -822,15 +837,14 @@ function blockButton(username, onChange) {
   const button = h('button', {
     class: 'danger',
     'aria-label': `Block @${username}`,
-    onclick: () => {
-      if (!confirm(`Block @${username}? This ends any friendship or request between you, and they won’t be able to see your profile, find you or send you requests.`)) return;
-      runAction(button, null, async () => {
+    onclick: () => confirmAction(
+      `Block @${username}? This ends any friendship or request between you, and they won’t be able to see your profile, find you or send you requests.`,
+      button, null, async () => {
         await api('POST', `/api/blocks/${encodeURIComponent(username)}`);
         announce(`Blocked @${username}.`);
         refreshBadge();
         onChange();
-      });
-    },
+      }),
   }, 'Block');
   return button;
 }
@@ -847,8 +861,7 @@ async function renderProfile(username, { focusActions = false } = {}) {
   const current = startView();
   setTitle(`@${username}`);
   const reload = (options) => renderProfile(username, options);
-  const profileUrl = (cursor) =>
-    `/api/users/${encodeURIComponent(username)}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`;
+  const profileUrl = (cursor) => apiUrl(`/api/users/${encodeURIComponent(username)}`, { cursor });
 
   app.replaceChildren(statusMessage('Loading…'));
   let profile;
@@ -861,21 +874,21 @@ async function renderProfile(username, { focusActions = false } = {}) {
   if (!current()) return;
 
   const status = {
-    friends: 'Friends',
-    outgoing: 'Friend request sent',
-    incoming: 'Wants to be your friend',
-    declined: 'Declined your friend request',
-    blocked: 'Blocked',
+    [RELATION.FRIENDS]: 'Friends',
+    [RELATION.OUTGOING]: 'Friend request sent',
+    [RELATION.INCOMING]: 'Wants to be your friend',
+    [RELATION.DECLINED]: 'Declined your friend request',
+    [RELATION.BLOCKED]: 'Blocked',
   }[profile.relation];
   const details = [joinedText(profile.joined), status].filter(Boolean).join(' · ');
-  const isSelf = profile.relation === 'self';
-  const canBlock = !['self', 'blocked'].includes(profile.relation);
+  const isSelf = profile.relation === RELATION.SELF;
+  const isBlocked = profile.relation === RELATION.BLOCKED;
   const afterAction = () => reload({ focusActions: true });
 
   const heading = h('h1', {}, `@${profile.username}`);
   const actions = h('div', { class: 'actions' },
     friendActions(profile.username, profile.relation, afterAction),
-    canBlock && blockButton(profile.username, afterAction),
+    !isSelf && !isBlocked && blockButton(profile.username, afterAction),
     isSelf && h('a', { class: 'button', href: '#/account' }, 'Account & privacy'));
 
   const list = h('div');
@@ -910,7 +923,7 @@ async function renderProfile(username, { focusActions = false } = {}) {
 
   if (profile.posts) {
     showPosts(profile);
-  } else if (profile.relation === 'blocked') {
+  } else if (isBlocked) {
     list.replaceChildren(statusMessage(`You’ve blocked @${profile.username}.`));
   } else {
     list.replaceChildren(statusMessage(`Become friends with @${profile.username} to see their posts.`));
@@ -923,12 +936,7 @@ async function renderProfile(username, { focusActions = false } = {}) {
 // ---------- Friends view ----------
 
 // "Find people" only lists users you have no friendship or request with (filtered by the server).
-const peopleUrl = (q, cursor) => {
-  const params = new URLSearchParams({ relation: 'none' });
-  if (q) params.set('q', q);
-  if (cursor) params.set('cursor', cursor);
-  return `/api/users?${params}`;
-};
+const peopleUrl = (q, cursor) => apiUrl('/api/users', { relation: RELATION.NONE, q, cursor });
 
 function renderFriends() {
   const current = startView();
@@ -959,9 +967,9 @@ function renderFriends() {
       );
 
     lists.replaceChildren(
-      data.incoming.length ? section('incoming', 'Friend requests', data.incoming, 'incoming', '') : '',
-      section('friends', 'Friends', data.friends, 'friends', 'No friends yet — find people below.'),
-      data.outgoing.length ? section('outgoing', 'Sent requests', data.outgoing, 'outgoing', '') : '',
+      data.incoming.length ? section('incoming', 'Friend requests', data.incoming, RELATION.INCOMING, '') : '',
+      section('friends', 'Friends', data.friends, RELATION.FRIENDS, 'No friends yet — find people below.'),
+      data.outgoing.length ? section('outgoing', 'Sent requests', data.outgoing, RELATION.OUTGOING, '') : '',
     );
     if (focus) {
       const row = [...lists.querySelectorAll('.user-row')].find((r) => r.dataset.username === focus.name);
@@ -1005,16 +1013,16 @@ function renderFriends() {
     }, personRow);
   };
 
-  const findInput = h('input', { type: 'search', maxlength: MAX_SEARCH_LENGTH, placeholder: 'Find people by username…', autocomplete: 'off' });
+  const findInput = h('input', { type: 'search', maxlength: CONFIG.maxSearchLength, placeholder: 'Find people by username…', autocomplete: 'off' });
   const searchHint = () => {
     peopleList.replaceChildren();
-    setFindStatus(`Type the first ${MIN_USER_SEARCH_LENGTH} or more letters of their username.`);
+    setFindStatus(`Type the first ${CONFIG.minUserSearchLength} or more letters of their username.`);
   };
   const nextSearch = latestOnly();
   const find = async () => {
     const isLatest = nextSearch();
     const q = findInput.value.trim();
-    if (q.length < MIN_USER_SEARCH_LENGTH) return searchHint();
+    if (q.length < CONFIG.minUserSearchLength) return searchHint();
     try {
       const page = await api('GET', peopleUrl(q));
       if (isLatest()) showPeople(page, q);
@@ -1065,7 +1073,7 @@ async function renderAccount() {
   const showBlocked = (names, focusIndex) => {
     const title = h('h2', {}, `Blocked (${names.length})`);
     const rows = names.map((name, i) =>
-      userRow(name, friendActions(name, 'blocked', () => showBlocked(names.filter((n) => n !== name), i))));
+      userRow(name, friendActions(name, RELATION.BLOCKED, () => showBlocked(names.filter((n) => n !== name), i))));
     blockedSection.replaceChildren(title, names.length
       ? h('ul', { class: 'user-list' }, rows)
       : h('p', { class: 'muted flush' }, 'You haven’t blocked anyone. Use “Block” on a profile.'));
@@ -1076,14 +1084,11 @@ async function renderAccount() {
   const logoutAllError = h('p', { class: 'error compact', role: 'alert' });
   const logoutAll = h('button', {
     class: 'secondary',
-    onclick: () => {
-      if (!confirm('Log out of Chirp on every device, including this one?')) return;
-      runAction(logoutAll, logoutAllError, async () => {
+    onclick: () => confirmAction('Log out of Chirp on every device, including this one?', logoutAll, logoutAllError,
+      async () => {
         await api('POST', '/api/logout-all');
-        me = null;
-        navigate('#/');
-      });
-    },
+        loggedOut();
+      }),
   }, 'Log out everywhere');
 
   const deleteError = h('p', { class: 'error', role: 'alert', id: newId('error') });
@@ -1096,24 +1101,21 @@ async function renderAccount() {
     oninput: () => password.removeAttribute('aria-invalid'),
   });
   const deleteBtn = h('button', { type: 'submit', class: 'danger' }, 'Delete my account');
-  const deleteForm = h('form', {
-    class: 'account-delete',
-    onsubmit: (e) => {
-      e.preventDefault();
-      if (!confirm('Permanently delete your account, posts, comments, likes and friendships? This can’t be undone.')) return;
-      runAction(deleteBtn, deleteError, async () => {
-        try {
-          await api('DELETE', '/api/me', { password: password.value });
-        } catch (err) {
-          if (err.status === 403) {
-            password.setAttribute('aria-invalid', 'true');
-            password.focus();
-          }
-          throw err;
+  const deleteForm = asyncForm({ class: 'account-delete' }, {
+    submit: deleteBtn,
+    error: deleteError,
+    validate: () => confirm('Permanently delete your account, posts, comments, likes and friendships? This can’t be undone.'),
+    onSubmit: async () => {
+      try {
+        await api('DELETE', '/api/me', { password: password.value });
+      } catch (err) {
+        if (err.status === 403) {
+          password.setAttribute('aria-invalid', 'true');
+          password.focus();
         }
-        me = null;
-        navigate('#/');
-      });
+        throw err;
+      }
+      loggedOut();
     },
   }, h('label', { for: password.id }, 'Password'), password, deleteBtn, deleteError);
 
@@ -1171,10 +1173,18 @@ document.querySelector('.skip-link').addEventListener('click', (e) => {
   focusElement(app.querySelector('h1') ?? app);
 });
 
+// Fetch the limits and names shared with the server (once).
+async function loadConfig() {
+  if (RELATION.NONE) return;
+  const { relation, ...config } = await api('GET', '/api/config');
+  Object.assign(CONFIG, config);
+  Object.assign(RELATION, relation);
+}
+
 // On startup, a failure other than 401 (e.g. offline) shows Retry instead of the login form.
 async function start() {
   try {
-    await refreshMe();
+    await Promise.all([loadConfig(), refreshMe()]);
   } catch (err) {
     startView();
     showLoadError(app, err, start);
