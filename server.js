@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { db, checkpoint } from './db.js';
+import { db, checkpoint, FRIENDSHIP_STATUS as STATUS } from './db.js';
 import { COMMON_PASSWORDS } from './common-passwords.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,19 +17,43 @@ const SESSION_IDLE_MS = 14 * DAY; // A session expires after 14 days without use
 const SESSION_MAX_MS = 90 * DAY; // ...and 90 days after login, however often it's used.
 const SESSION_REFRESH_MS = DAY; // Slide the expiry forward at most once a day.
 const MAX_POST_LENGTH = 280;
+const MAX_COMMENT_LENGTH = 280;
 const MAX_SEARCH_LENGTH = 100;
 const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_LENGTH = 200;
-const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const MIN_USERNAME_LENGTH = 3;
+const MAX_USERNAME_LENGTH = 20;
+// Without anchors, so the frontend can use it as an <input pattern> (which is implicitly anchored).
+const USERNAME_PATTERN = `[a-zA-Z0-9_]{${MIN_USERNAME_LENGTH},${MAX_USERNAME_LENGTH}}`;
+const USERNAME_RE = new RegExp(`^${USERNAME_PATTERN}$`);
+const JSON_BODY_LIMIT = '10kb';
 const POSTS_PAGE_SIZE = 50;
 const USERS_PAGE_SIZE = 10;
 // Searches that can list strangers must give at least this many leading characters of a username.
 const MIN_USER_SEARCH_LENGTH = 3;
 // After someone declines your friend request, you can't ask them again for this long.
-const DECLINE_COOLDOWN_MS = 30 * DAY;
-// Session cookies are Secure unless COOKIE_SECURE=false; see cookieMode().
+const DECLINE_COOLDOWN_DAYS = 30;
+const DECLINE_COOLDOWN_MS = DECLINE_COOLDOWN_DAYS * DAY;
+// Session cookies are Secure unless COOKIE_SECURE=false; see sessionCookie().
 const COOKIE_SECURE = process.env.COOKIE_SECURE !== 'false';
+const SESSION_COOKIE = '__Host-sid';
+const DEV_SESSION_COOKIE = 'sid'; // Plain-HTTP localhost only; the __Host- prefix requires Secure.
+const SESSION_TOKEN_BYTES = 32;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+// How the current user relates to another user; see getRelation(). Sent to the client as `relation`.
+const RELATION = Object.freeze({
+  SELF: 'self',
+  FRIENDS: 'friends',
+  OUTGOING: 'outgoing', // You asked them.
+  INCOMING: 'incoming', // They asked you.
+  DECLINED: 'declined', // They declined your request recently.
+  BLOCKED: 'blocked', // You blocked them.
+  BLOCKED_BY: 'blocked-by', // They blocked you. Never sent to the client.
+  NONE: 'none',
+});
+
+const nowIso = () => new Date().toISOString();
 
 const app = express();
 app.disable('x-powered-by');
@@ -54,7 +78,7 @@ app.use(helmet({
   },
   xFrameOptions: { action: 'deny' }, // Matches frame-ancestors 'none' for older browsers.
 }));
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- Auth helpers ----------
@@ -64,6 +88,8 @@ const scrypt = promisify(crypto.scrypt);
 const SCRYPT_PARAMS = { N: 2 ** 17, r: 8, p: 1 };
 // Hashes from before the parameters were stored ("salt:hash") used Node's defaults.
 const LEGACY_SCRYPT_PARAMS = { N: 2 ** 14, r: 8, p: 1 };
+const SCRYPT_KEY_LENGTH = 64; // Bytes.
+const SCRYPT_SALT_LENGTH = 16; // Bytes.
 const HEX_RE = /^(?:[0-9a-f]{2})+$/i;
 
 function deriveKey(password, salt, { N, r, p }, keylen) {
@@ -73,8 +99,8 @@ function deriveKey(password, salt, { N, r, p }, keylen) {
 // Stored as "scrypt$N$r$p$<salt hex>$<hash hex>" so the cost can be raised later.
 async function hashPassword(password) {
   const { N, r, p } = SCRYPT_PARAMS;
-  const salt = crypto.randomBytes(16);
-  const hash = await deriveKey(password, salt, SCRYPT_PARAMS, 64);
+  const salt = crypto.randomBytes(SCRYPT_SALT_LENGTH);
+  const hash = await deriveKey(password, salt, SCRYPT_PARAMS, SCRYPT_KEY_LENGTH);
   return ['scrypt', N, r, p, salt.toString('hex'), hash.toString('hex')].join('$');
 }
 
@@ -118,7 +144,7 @@ function needsRehash(stored) {
 }
 
 // Login checks unknown usernames against this, so they take as long as wrong passwords.
-const DUMMY_PASSWORD_HASH = await hashPassword(crypto.randomBytes(16).toString('hex'));
+const DUMMY_PASSWORD_HASH = await hashPassword(crypto.randomBytes(SCRYPT_SALT_LENGTH).toString('hex'));
 
 function passwordProblem(password, username) {
   if (password.length < MIN_PASSWORD_LENGTH) return `Password must be at least ${MIN_PASSWORD_LENGTH} characters`;
@@ -142,36 +168,44 @@ function getCookie(req, name) {
   return null;
 }
 
-// The session cookie is "__Host-sid": Secure, host-only and path=/, so it never travels over
-// plain HTTP and can't be set by a subdomain. Plain-HTTP requests to localhost (local dev) and
-// COOKIE_SECURE=false use an ordinary "sid" cookie instead, since that prefix requires Secure.
-function cookieMode(req) {
+// The session cookie is SESSION_COOKIE ("__Host-sid"): Secure, host-only and path=/, so it never
+// travels over plain HTTP and can't be set by a subdomain. Plain-HTTP requests to localhost (local
+// dev) and COOKIE_SECURE=false use DEV_SESSION_COOKIE ("sid") instead, since that prefix requires
+// Secure. Returns the cookie's name and the options for setting or clearing it.
+function sessionCookie(req) {
   const secure = COOKIE_SECURE && (req.secure || !LOOPBACK_HOSTS.has(req.hostname));
-  return secure ? { name: '__Host-sid', secure: true } : { name: 'sid', secure: false };
+  return {
+    name: secure ? SESSION_COOKIE : DEV_SESSION_COOKIE,
+    options: { httpOnly: true, sameSite: 'strict', secure, path: '/' },
+  };
 }
 
-function cookieOptions(req) {
-  return { httpOnly: true, sameSite: 'strict', secure: cookieMode(req).secure, path: '/' };
+function setSessionCookie(req, res, token, maxAge) {
+  const { name, options } = sessionCookie(req);
+  res.cookie(name, token, { ...options, maxAge });
 }
+
+function clearSessionCookie(req, res) {
+  const { name, options } = sessionCookie(req);
+  res.clearCookie(name, options);
+}
+
+const sessionToken = (req) => getCookie(req, sessionCookie(req).name);
 
 // Only a SHA-256 of the token is stored, so a leaked database can't be used to log in.
 const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 
 function startSession(req, res, userId) {
-  const token = crypto.randomBytes(32).toString('hex');
+  const token = crypto.randomBytes(SESSION_TOKEN_BYTES).toString('hex');
   const now = Date.now();
   db.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
     .run(hashToken(token), userId, now, now + SESSION_IDLE_MS);
-  res.cookie(cookieMode(req).name, token, { ...cookieOptions(req), maxAge: SESSION_IDLE_MS });
-}
-
-function clearSessionCookie(req, res) {
-  res.clearCookie(cookieMode(req).name, cookieOptions(req));
+  setSessionCookie(req, res, token, SESSION_IDLE_MS);
 }
 
 // Attach req.user on every API request if the session cookie is valid, and slide its expiry.
 app.use('/api', (req, res, next) => {
-  const token = getCookie(req, cookieMode(req).name);
+  const token = sessionToken(req);
   if (!token) return next();
   const now = Date.now();
   const tokenHash = hashToken(token);
@@ -184,7 +218,7 @@ app.use('/api', (req, res, next) => {
   const expiresAt = Math.min(now + SESSION_IDLE_MS, session.created_at + SESSION_MAX_MS);
   if (expiresAt - session.expires_at > SESSION_REFRESH_MS) {
     db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(expiresAt, tokenHash);
-    res.cookie(cookieMode(req).name, token, { ...cookieOptions(req), maxAge: expiresAt - now });
+    setSessionCookie(req, res, token, expiresAt - now);
   }
   next();
 });
@@ -237,7 +271,7 @@ const signupLimiter = limiter(HOUR, 10, 'sign-ups from your network');
 const loginIpLimiter = limiter(15 * MINUTE, 30, 'failed logins from your network', { skipSuccessfulRequests: true });
 const loginUserLimiter = limiter(15 * MINUTE, 10, 'failed logins for this account', {
   skipSuccessfulRequests: true,
-  keyGenerator: (req) => `username:${String(req.body?.username ?? '').trim().toLowerCase()}`,
+  keyGenerator: (req) => `username:${readCredentials(req).username.toLowerCase()}`,
 });
 const postLimiter = limiter(15 * MINUTE, 30, 'posts', { keyGenerator: byUser });
 const commentLimiter = limiter(15 * MINUTE, 60, 'comments', { keyGenerator: byUser });
@@ -258,13 +292,32 @@ const exportLimiter = limiter(HOUR, 10, 'data exports', { keyGenerator: byUser }
 
 // ---------- Input validation ----------
 
-// Route ids must be positive integers. Digits only, so "1e3", "0x10" or "1.0" are refused too.
+// Route ids must be positive integers. Digits only, so "1e3", "0x10", "1.0" or "NaN" are refused
+// too. The parsed id is left in req.id.
 app.param('id', (req, res, next, value) => {
   if (!/^[1-9]\d{0,15}$/.test(value) || !Number.isSafeInteger(Number(value))) {
     return res.status(400).json({ error: 'Invalid id' });
   }
+  req.id = Number(value);
   next();
 });
+
+// The username (trimmed) and password from a signup or login body.
+function readCredentials(req) {
+  return {
+    username: String(req.body?.username ?? '').trim(),
+    password: String(req.body?.password ?? ''),
+  };
+}
+
+// The trimmed `body` of a post or comment, or undefined (after replying 400) if it's empty or
+// longer than `maxLength`. `noun` ("Post", "Comment") is used in the error message.
+function validateBody(req, res, noun, maxLength) {
+  const body = String(req.body?.body ?? '').trim();
+  if (!body) res.status(400).json({ error: `${noun} cannot be empty` });
+  else if (body.length > maxLength) res.status(400).json({ error: `${noun}s are limited to ${maxLength} characters` });
+  else return body;
+}
 
 // The trimmed `q` query parameter, or undefined (after replying 400) if it's too long,
 // since every search is a LIKE '%…%' scan.
@@ -274,13 +327,37 @@ function searchQuery(req, res) {
   res.status(400).json({ error: `Searches are limited to ${MAX_SEARCH_LENGTH} characters` });
 }
 
+// Middleware that reads the friend action's `intent` (from the body or the query string) into
+// req.intent, replying 400 unless it's one of `allowed` (or missing, when `optional`).
+function requireIntent(allowed, { optional = false } = {}) {
+  const quoted = allowed.map((intent) => `'${intent}'`);
+  const error = `intent must be ${quoted.slice(0, -1).join(', ')} or ${quoted.at(-1)}`;
+  return (req, res, next) => {
+    const intent = String(req.body?.intent ?? req.query.intent ?? '');
+    if (!allowed.includes(intent) && !(optional && !intent)) return res.status(400).json({ error });
+    req.intent = intent;
+    next();
+  };
+}
+
 // ---------- Friendship helpers ----------
+
+// SQL condition: the friendships row (alias prefix `f`, e.g. 'f.') is between users `a` and `b`,
+// whichever of them sent it.
+const eitherDirectionSql = (a, b, f = '') =>
+  `((${f}requester_id = ${a} AND ${f}addressee_id = ${b}) OR (${f}requester_id = ${b} AND ${f}addressee_id = ${a}))`;
+
+// SQL condition: the friendships row involves $me, in either role.
+const involvesMeSql = (f = '') => `(${f}requester_id = $me OR ${f}addressee_id = $me)`;
+
+// SQL expression: the id of the user at the other end of a friendships row from $me.
+const otherUserSql = (f = '') => `CASE WHEN ${f}requester_id = $me THEN ${f}addressee_id ELSE ${f}requester_id END`;
 
 // Subquery that yields the ids of everyone who is an accepted friend of $me.
 const FRIEND_IDS_SQL = `
-  SELECT CASE WHEN requester_id = $me THEN addressee_id ELSE requester_id END
+  SELECT ${otherUserSql()}
   FROM friendships
-  WHERE status = 'accepted' AND (requester_id = $me OR addressee_id = $me)
+  WHERE status = '${STATUS.ACCEPTED}' AND ${involvesMeSql()}
 `;
 
 // A comment is shown to its author, the post's owner, and the commenter's accepted friends
@@ -290,45 +367,36 @@ const COMMENT_VISIBLE_SQL = `(c.user_id = $me OR p.user_id = $me OR c.user_id IN
 // A declined request stops the requester from asking again until this ISO time has passed.
 const declinedSince = () => new Date(Date.now() - DECLINE_COOLDOWN_MS).toISOString();
 
-// Relation of $me to user alias u, given the friendship row alias f (LEFT JOINed). Must match
-// relation() below.
+// Relationship of $me to user alias u, given the friendship row alias f (LEFT JOINed). Must match
+// getRelation() below.
 const RELATION_SQL = `
   CASE
-    WHEN f.status IS NULL THEN 'none'
-    WHEN f.status = 'accepted' THEN 'friends'
-    WHEN f.status = 'pending' THEN CASE WHEN f.requester_id = $me THEN 'outgoing' ELSE 'incoming' END
-    WHEN f.status = 'blocked' THEN CASE WHEN f.requester_id = $me THEN 'blocked' ELSE 'blocked-by' END
-    WHEN f.requester_id = $me AND f.responded_at > $declinedSince THEN 'declined'
-    ELSE 'none'
+    WHEN f.status IS NULL THEN '${RELATION.NONE}'
+    WHEN f.status = '${STATUS.ACCEPTED}' THEN '${RELATION.FRIENDS}'
+    WHEN f.status = '${STATUS.PENDING}'
+      THEN CASE WHEN f.requester_id = $me THEN '${RELATION.OUTGOING}' ELSE '${RELATION.INCOMING}' END
+    WHEN f.status = '${STATUS.BLOCKED}'
+      THEN CASE WHEN f.requester_id = $me THEN '${RELATION.BLOCKED}' ELSE '${RELATION.BLOCKED_BY}' END
+    WHEN f.requester_id = $me AND f.responded_at > $declinedSince THEN '${RELATION.DECLINED}'
+    ELSE '${RELATION.NONE}'
   END
 `;
 
-// Returns 'self' | 'friends' | 'outgoing' | 'incoming' | 'declined' (they declined your request
-// recently) | 'blocked' (you blocked them) | 'blocked-by' (they blocked you) | 'none'.
-// Someone who declined a request sees 'none' and may send a request themselves.
-// 'blocked-by' is never sent to the client: routes answer as if the user didn't exist.
-function relation(meId, otherId) {
-  if (meId === otherId) return 'self';
+// Returns one of RELATION. Someone who declined a request sees NONE and may send a request
+// themselves. BLOCKED_BY is never sent to the client: routes answer as if the user didn't exist.
+function getRelation(meId, otherId) {
+  if (meId === otherId) return RELATION.SELF;
   const row = db.prepare(`
-    SELECT requester_id, status, responded_at FROM friendships
-    WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
-  `).get(meId, otherId, otherId, meId);
-  if (!row) return 'none';
+    SELECT requester_id, status, responded_at FROM friendships WHERE ${eitherDirectionSql('$a', '$b')}
+  `).get({ a: meId, b: otherId });
+  if (!row) return RELATION.NONE;
   const mine = row.requester_id === meId;
   switch (row.status) {
-    case 'accepted': return 'friends';
-    case 'pending': return mine ? 'outgoing' : 'incoming';
-    case 'blocked': return mine ? 'blocked' : 'blocked-by';
-    default: return mine && row.responded_at > declinedSince() ? 'declined' : 'none';
+    case STATUS.ACCEPTED: return RELATION.FRIENDS;
+    case STATUS.PENDING: return mine ? RELATION.OUTGOING : RELATION.INCOMING;
+    case STATUS.BLOCKED: return mine ? RELATION.BLOCKED : RELATION.BLOCKED_BY;
+    default: return mine && row.responded_at > declinedSince() ? RELATION.DECLINED : RELATION.NONE;
   }
-}
-
-// Remove whatever row exists between two users (both directions).
-function deleteFriendship(aId, bId) {
-  db.prepare(`
-    DELETE FROM friendships
-    WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
-  `).run(aId, bId, bId, aId);
 }
 
 // Run `fn` inside a transaction.
@@ -344,8 +412,40 @@ function transaction(fn) {
   }
 }
 
+// Remove whatever row exists between two users (both directions).
+function deleteFriendship(aId, bId) {
+  db.prepare(`DELETE FROM friendships WHERE ${eitherDirectionSql('$a', '$b')}`).run({ a: aId, b: bId });
+}
+
+// Replace whatever row exists between two users with a new one from `requesterId` in `status`.
+function replaceFriendship(requesterId, addresseeId, status) {
+  transaction(() => {
+    deleteFriendship(requesterId, addresseeId);
+    db.prepare('INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, ?, ?)')
+      .run(requesterId, addresseeId, status, nowIso());
+  });
+}
+
+// Accept or decline the pending request from `requesterId` to `addresseeId`.
+function respondToRequest(requesterId, addresseeId, status) {
+  db.prepare('UPDATE friendships SET status = ?, responded_at = ? WHERE requester_id = ? AND addressee_id = ?')
+    .run(status, nowIso(), requesterId, addresseeId);
+}
+
 function findUser(username) {
   return db.prepare('SELECT id, username, created_at FROM users WHERE username = ?').get(username);
+}
+
+// Middleware for /:username routes, after requireAuth and any rate limiter: sets
+// req.other = { user, relationship }, or replies 404 if there's no such user or they blocked you,
+// so a block looks the same as a missing account. (Not app.param: param callbacks run before the
+// route's requireAuth and rate limiters, and userLookupLimiter has to see these 404s.)
+function loadVisibleUser(req, res, next) {
+  const user = findUser(req.params.username);
+  const relationship = user && getRelation(req.user.id, user.id);
+  if (!user || relationship === RELATION.BLOCKED_BY) return res.status(404).json({ error: 'User not found' });
+  req.other = { user, relationship };
+  next();
 }
 
 // ---------- Post helpers ----------
@@ -362,6 +462,17 @@ function parsePostCursor(cursor) {
   if (sep < 1 || !Number.isInteger(id)) return null;
   return { createdAt: text.slice(0, sep), id };
 }
+
+const formatPost = (meId) => (p) => ({
+  id: p.id,
+  body: p.body,
+  createdAt: p.created_at,
+  username: p.username,
+  likeCount: p.like_count,
+  liked: Boolean(p.liked),
+  commentCount: p.comment_count,
+  mine: p.user_id === meId,
+});
 
 // One page of posts visible to `meId`: their own plus accepted friends', newest first.
 // Optionally restricted to one author and/or filtered by a search term.
@@ -398,32 +509,51 @@ function visiblePosts(meId, { authorId = null, search = null, cursor = null } = 
   };
 }
 
-const formatPost = (meId) => (p) => ({
-  id: p.id,
-  body: p.body,
-  createdAt: p.created_at,
-  username: p.username,
-  likeCount: p.like_count,
-  liked: Boolean(p.liked),
-  commentCount: p.comment_count,
-  mine: p.user_id === meId,
+function isPostVisible(meId, postId) {
+  return Boolean(db.prepare(`
+    SELECT 1 FROM posts WHERE id = $post AND (user_id = $me OR user_id IN (${FRIEND_IDS_SQL}))
+  `).get({ post: postId, me: meId }));
+}
+
+// Middleware for /api/posts/:id/... routes, after requireAuth: 404 unless you can see the post.
+function requireVisiblePost(req, res, next) {
+  if (!isPostVisible(req.user.id, req.id)) return res.status(404).json({ error: 'Post not found' });
+  next();
+}
+
+// ---------- Config ----------
+
+// Limits and names the frontend shares with the server, so they're defined only here.
+// BLOCKED_BY is left out: the client never sees it.
+const { BLOCKED_BY, ...CLIENT_RELATION } = RELATION;
+const CLIENT_CONFIG = Object.freeze({
+  maxPostLength: MAX_POST_LENGTH,
+  maxCommentLength: MAX_COMMENT_LENGTH,
+  maxSearchLength: MAX_SEARCH_LENGTH,
+  minUserSearchLength: MIN_USER_SEARCH_LENGTH,
+  minUsernameLength: MIN_USERNAME_LENGTH,
+  maxUsernameLength: MAX_USERNAME_LENGTH,
+  usernamePattern: USERNAME_PATTERN,
+  minPasswordLength: MIN_PASSWORD_LENGTH,
+  maxPasswordLength: MAX_PASSWORD_LENGTH,
+  declineCooldownDays: DECLINE_COOLDOWN_DAYS,
+  relation: CLIENT_RELATION,
 });
 
-function canSeePost(meId, postId) {
-  return db.prepare(`
-    SELECT 1 FROM posts WHERE id = $post AND (user_id = $me OR user_id IN (${FRIEND_IDS_SQL}))
-  `).get({ post: postId, me: meId });
-}
+app.get('/api/config', (req, res) => {
+  res.json(CLIENT_CONFIG);
+});
 
 // ---------- Auth routes ----------
 
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 app.post('/api/signup', signupLimiter, async (req, res) => {
-  const username = String(req.body?.username ?? '').trim();
-  const password = String(req.body?.password ?? '');
+  const { username, password } = readCredentials(req);
   if (!USERNAME_RE.test(username)) {
-    return res.status(400).json({ error: 'Username must be 3–20 letters, numbers, or underscores' });
+    return res.status(400).json({
+      error: `Username must be ${MIN_USERNAME_LENGTH}–${MAX_USERNAME_LENGTH} letters, numbers, or underscores`,
+    });
   }
   const problem = passwordProblem(password, username);
   if (problem) return res.status(400).json({ error: problem });
@@ -435,7 +565,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
   try {
     const { lastInsertRowid } = db.prepare(
       'INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)'
-    ).run(username, passwordHash, new Date().toISOString());
+    ).run(username, passwordHash, nowIso());
     userId = Number(lastInsertRowid);
   } catch (err) {
     // Someone else took the name while we were hashing.
@@ -447,8 +577,7 @@ app.post('/api/signup', signupLimiter, async (req, res) => {
 });
 
 app.post('/api/login', loginIpLimiter, loginUserLimiter, async (req, res) => {
-  const username = String(req.body?.username ?? '').trim();
-  const password = String(req.body?.password ?? '');
+  const { username, password } = readCredentials(req);
   const user = db.prepare('SELECT id, username, password_hash FROM users WHERE username = ?').get(username);
   // Always run scrypt, even for unknown usernames, so response time doesn't reveal which exist.
   const ok = await verifyPassword(password, user ? user.password_hash : DUMMY_PASSWORD_HASH);
@@ -464,7 +593,7 @@ app.post('/api/login', loginIpLimiter, loginUserLimiter, async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  const token = getCookie(req, cookieMode(req).name);
+  const token = sessionToken(req);
   if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
   clearSessionCookie(req, res);
   res.json({ ok: true });
@@ -479,8 +608,8 @@ app.post('/api/logout-all', requireAuth, (req, res) => {
 
 app.get('/api/me', requireAuth, (req, res) => {
   const { pending } = db.prepare(
-    "SELECT COUNT(*) AS pending FROM friendships WHERE addressee_id = ? AND status = 'pending'"
-  ).get(req.user.id);
+    'SELECT COUNT(*) AS pending FROM friendships WHERE addressee_id = ? AND status = ?'
+  ).get(req.user.id, STATUS.PENDING);
   res.json({ username: req.user.username, pendingRequests: pending });
 });
 
@@ -525,14 +654,15 @@ app.get('/api/me/export', requireAuth, exportLimiter, (req, res) => {
   const friendships = db.prepare(`
     SELECT u.username, f.requester_id, f.status, f.created_at, f.responded_at
     FROM friendships f
-    JOIN users u ON u.id = CASE WHEN f.requester_id = $me THEN f.addressee_id ELSE f.requester_id END
-    WHERE (f.requester_id = $me OR f.addressee_id = $me) AND NOT (f.status = 'blocked' AND f.addressee_id = $me)
+    JOIN users u ON u.id = ${otherUserSql('f.')}
+    WHERE ${involvesMeSql('f.')} AND NOT (f.status = '${STATUS.BLOCKED}' AND f.addressee_id = $me)
     ORDER BY u.username COLLATE NOCASE
   `).all({ me });
 
-  res.attachment(`chirp-${user.username}-${new Date().toISOString().slice(0, 10)}.json`);
+  const exportedAt = nowIso();
+  res.attachment(`chirp-${user.username}-${exportedAt.slice(0, 10)}.json`);
   res.json({
-    exportedAt: new Date().toISOString(),
+    exportedAt,
     account: { username: user.username, joined: user.created_at },
     posts: posts.map((p) => ({
       id: p.id, body: p.body, createdAt: p.created_at, likeCount: p.like_count, commentCount: p.comment_count,
@@ -560,20 +690,16 @@ app.get('/api/feed', requireAuth, (req, res) => {
 });
 
 app.post('/api/posts', requireAuth, postLimiter, (req, res) => {
-  const body = String(req.body?.body ?? '').trim();
-  if (!body) return res.status(400).json({ error: 'Post cannot be empty' });
-  if (body.length > MAX_POST_LENGTH) {
-    return res.status(400).json({ error: `Posts are limited to ${MAX_POST_LENGTH} characters` });
-  }
+  const body = validateBody(req, res, 'Post', MAX_POST_LENGTH);
+  if (body === undefined) return;
   const { lastInsertRowid } = db.prepare(
     'INSERT INTO posts (user_id, body, created_at) VALUES (?, ?, ?)'
-  ).run(req.user.id, body, new Date().toISOString());
+  ).run(req.user.id, body, nowIso());
   res.status(201).json({ id: Number(lastInsertRowid) });
 });
 
 app.delete('/api/posts/:id', requireAuth, (req, res) => {
-  const { changes } = db.prepare('DELETE FROM posts WHERE id = ? AND user_id = ?')
-    .run(Number(req.params.id), req.user.id);
+  const { changes } = db.prepare('DELETE FROM posts WHERE id = ? AND user_id = ?').run(req.id, req.user.id);
   if (!changes) return res.status(404).json({ error: 'Post not found' });
   res.json({ ok: true });
 });
@@ -588,27 +714,21 @@ function likeState(meId, postId) {
   return { liked: Boolean(row.liked), likeCount: row.like_count };
 }
 
-app.post('/api/posts/:id/like', requireAuth, (req, res) => {
-  const postId = Number(req.params.id);
-  if (!canSeePost(req.user.id, postId)) return res.status(404).json({ error: 'Post not found' });
-  db.prepare('INSERT OR IGNORE INTO likes (user_id, post_id) VALUES (?, ?)').run(req.user.id, postId);
-  res.json(likeState(req.user.id, postId));
+app.post('/api/posts/:id/like', requireAuth, requireVisiblePost, (req, res) => {
+  db.prepare('INSERT OR IGNORE INTO likes (user_id, post_id) VALUES (?, ?)').run(req.user.id, req.id);
+  res.json(likeState(req.user.id, req.id));
 });
 
-app.delete('/api/posts/:id/like', requireAuth, (req, res) => {
-  const postId = Number(req.params.id);
-  if (!canSeePost(req.user.id, postId)) return res.status(404).json({ error: 'Post not found' });
-  db.prepare('DELETE FROM likes WHERE user_id = ? AND post_id = ?').run(req.user.id, postId);
-  res.json(likeState(req.user.id, postId));
+app.delete('/api/posts/:id/like', requireAuth, requireVisiblePost, (req, res) => {
+  db.prepare('DELETE FROM likes WHERE user_id = ? AND post_id = ?').run(req.user.id, req.id);
+  res.json(likeState(req.user.id, req.id));
 });
 
 // ---------- Comment routes ----------
 
 // Comments on a post, oldest first. Only those you may see (COMMENT_VISIBLE_SQL) are returned:
 // yours, all of them on your own posts, and otherwise only those by your friends.
-app.get('/api/posts/:id/comments', requireAuth, (req, res) => {
-  const postId = Number(req.params.id);
-  if (!canSeePost(req.user.id, postId)) return res.status(404).json({ error: 'Post not found' });
+app.get('/api/posts/:id/comments', requireAuth, requireVisiblePost, (req, res) => {
   const rows = db.prepare(`
     SELECT c.id, c.user_id, c.body, c.created_at, u.username, p.user_id AS post_owner_id
     FROM comments c
@@ -616,7 +736,7 @@ app.get('/api/posts/:id/comments', requireAuth, (req, res) => {
     JOIN posts p ON p.id = c.post_id
     WHERE c.post_id = $post AND ${COMMENT_VISIBLE_SQL}
     ORDER BY c.created_at, c.id
-  `).all({ post: postId, me: req.user.id });
+  `).all({ post: req.id, me: req.user.id });
   res.json(rows.map((c) => ({
     id: c.id,
     body: c.body,
@@ -627,17 +747,12 @@ app.get('/api/posts/:id/comments', requireAuth, (req, res) => {
   })));
 });
 
-app.post('/api/posts/:id/comments', requireAuth, commentLimiter, (req, res) => {
-  const postId = Number(req.params.id);
-  if (!canSeePost(req.user.id, postId)) return res.status(404).json({ error: 'Post not found' });
-  const body = String(req.body?.body ?? '').trim();
-  if (!body) return res.status(400).json({ error: 'Comment cannot be empty' });
-  if (body.length > MAX_POST_LENGTH) {
-    return res.status(400).json({ error: `Comments are limited to ${MAX_POST_LENGTH} characters` });
-  }
+app.post('/api/posts/:id/comments', requireAuth, commentLimiter, requireVisiblePost, (req, res) => {
+  const body = validateBody(req, res, 'Comment', MAX_COMMENT_LENGTH);
+  if (body === undefined) return;
   const { lastInsertRowid } = db.prepare(
     'INSERT INTO comments (post_id, user_id, body, created_at) VALUES (?, ?, ?, ?)'
-  ).run(postId, req.user.id, body, new Date().toISOString());
+  ).run(req.id, req.user.id, body, nowIso());
   res.status(201).json({ id: Number(lastInsertRowid) });
 });
 
@@ -645,7 +760,7 @@ app.delete('/api/comments/:id', requireAuth, (req, res) => {
   const { changes } = db.prepare(`
     DELETE FROM comments
     WHERE id = $id AND (user_id = $me OR post_id IN (SELECT id FROM posts WHERE user_id = $me))
-  `).run({ id: Number(req.params.id), me: req.user.id });
+  `).run({ id: req.id, me: req.user.id });
   if (!changes) return res.status(404).json({ error: 'Comment not found' });
   res.json({ ok: true });
 });
@@ -657,27 +772,28 @@ app.delete('/api/comments/:id', requireAuth, (req, res) => {
 // is the last username seen. To keep the user list from being walked, a search that can return
 // strangers (no relation filter, or 'none') needs at least MIN_USER_SEARCH_LENGTH characters.
 // People who blocked you are never listed.
-const USER_RELATION_FILTERS = ['none', 'friends', 'outgoing', 'incoming', 'declined', 'blocked'];
+const USER_RELATION_FILTERS = [
+  RELATION.NONE, RELATION.FRIENDS, RELATION.OUTGOING, RELATION.INCOMING, RELATION.DECLINED, RELATION.BLOCKED,
+];
 app.get('/api/users', requireAuth, userSearchLimiter, (req, res) => {
   const q = searchQuery(req, res);
   if (q === undefined) return;
-  const rel = req.query.relation ? String(req.query.relation) : null;
-  if (rel && !USER_RELATION_FILTERS.includes(rel)) {
+  const relationFilter = req.query.relation ? String(req.query.relation) : null;
+  if (relationFilter && !USER_RELATION_FILTERS.includes(relationFilter)) {
     return res.status(400).json({ error: 'Unknown relation filter' });
   }
-  if ((!rel || rel === 'none') && q.length < MIN_USER_SEARCH_LENGTH) {
+  if ((!relationFilter || relationFilter === RELATION.NONE) && q.length < MIN_USER_SEARCH_LENGTH) {
     return res.status(400).json({ error: `Type at least ${MIN_USER_SEARCH_LENGTH} characters of a username` });
   }
   const rows = db.prepare(`
     SELECT username, relation FROM (
       SELECT u.username, ${RELATION_SQL} AS relation
       FROM users u
-      LEFT JOIN friendships f
-        ON (f.requester_id = $me AND f.addressee_id = u.id) OR (f.requester_id = u.id AND f.addressee_id = $me)
+      LEFT JOIN friendships f ON ${eitherDirectionSql('$me', 'u.id', 'f.')}
       WHERE u.id != $me AND u.username LIKE $q ESCAPE '\\'
         AND ($after IS NULL OR u.username > $after)
     )
-    WHERE relation != 'blocked-by' AND ($rel IS NULL OR relation = $rel)
+    WHERE relation != '${RELATION.BLOCKED_BY}' AND ($relation IS NULL OR relation = $relation)
     ORDER BY username COLLATE NOCASE
     LIMIT $limit
   `).all({
@@ -685,7 +801,7 @@ app.get('/api/users', requireAuth, userSearchLimiter, (req, res) => {
     q: `${escapeLike(q)}%`,
     after: req.query.cursor ? String(req.query.cursor) : null,
     declinedSince: declinedSince(),
-    rel,
+    relation: relationFilter,
     limit: USERS_PAGE_SIZE + 1,
   });
   const hasMore = rows.length > USERS_PAGE_SIZE;
@@ -693,30 +809,16 @@ app.get('/api/users', requireAuth, userSearchLimiter, (req, res) => {
   res.json({ users, nextCursor: hasMore ? users.at(-1).username : null });
 });
 
-// The user named in the route and your relation to them, or null (after replying 404) if there's
-// no such user or they blocked you, so a block looks the same as a missing account.
-function visibleUser(req, res) {
-  const user = findUser(req.params.username);
-  const rel = user && relation(req.user.id, user.id);
-  if (!user || rel === 'blocked-by') {
-    res.status(404).json({ error: 'User not found' });
-    return null;
-  }
-  return { user, rel };
-}
-
 // Profile plus one page of posts. Pass `cursor` (the previous nextCursor) for later pages.
 // `joined` is the month you signed up ("YYYY-MM"), shown only to yourself and friends (else null).
-app.get('/api/users/:username', requireAuth, userLookupLimiter, (req, res) => {
-  const found = visibleUser(req, res);
-  if (!found) return;
-  const { user, rel } = found;
-  const canSee = rel === 'self' || rel === 'friends';
+app.get('/api/users/:username', requireAuth, userLookupLimiter, loadVisibleUser, (req, res) => {
+  const { user, relationship } = req.other;
+  const canSee = relationship === RELATION.SELF || relationship === RELATION.FRIENDS;
   const page = canSee ? visiblePosts(req.user.id, { authorId: user.id, cursor: req.query.cursor }) : null;
   res.json({
     username: user.username,
     joined: canSee ? user.created_at.slice(0, 7) : null,
-    relation: rel,
+    relation: relationship,
     posts: page ? page.posts : null,
     nextCursor: page ? page.nextCursor : null,
   });
@@ -728,21 +830,19 @@ app.get('/api/friends', requireAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT f.requester_id, f.status, u.username
     FROM friendships f
-    JOIN users u ON u.id = CASE WHEN f.requester_id = $me THEN f.addressee_id ELSE f.requester_id END
-    WHERE f.requester_id = $me OR f.addressee_id = $me
+    JOIN users u ON u.id = ${otherUserSql('f.')}
+    WHERE ${involvesMeSql('f.')}
     ORDER BY u.username COLLATE NOCASE
   `).all({ me: req.user.id });
   const result = { friends: [], incoming: [], outgoing: [], blocked: [] };
   for (const r of rows) {
     const mine = r.requester_id === req.user.id;
-    if (r.status === 'accepted') result.friends.push(r.username);
-    else if (r.status === 'pending') result[mine ? 'outgoing' : 'incoming'].push(r.username);
-    else if (r.status === 'blocked' && mine) result.blocked.push(r.username);
+    if (r.status === STATUS.ACCEPTED) result.friends.push(r.username);
+    else if (r.status === STATUS.PENDING) result[mine ? 'outgoing' : 'incoming'].push(r.username);
+    else if (r.status === STATUS.BLOCKED && mine) result.blocked.push(r.username);
   }
   res.json(result);
 });
-
-const intentOf = (req) => String(req.body?.intent ?? req.query.intent ?? '');
 
 // Body: { intent: 'request' | 'accept' }.
 // - request: 201 if a new request was created; 200 if they had already asked you (it's accepted);
@@ -751,99 +851,75 @@ const intentOf = (req) => String(req.body?.intent ?? req.query.intent ?? '');
 // - accept: 200 if their pending request was accepted; 409 if there is no request to accept
 //   (e.g. they canceled it), so a stale "Accept" button never sends a new request.
 // 404 if the user doesn't exist or has blocked you.
-app.post('/api/friends/:username', requireAuth, friendLimiter, (req, res) => {
-  const intent = intentOf(req);
-  if (intent !== 'request' && intent !== 'accept') {
-    return res.status(400).json({ error: "intent must be 'request' or 'accept'" });
-  }
-  const found = visibleUser(req, res);
-  if (!found) return;
-  const { user: other, rel } = found;
-  if (rel === 'self') return res.status(400).json({ error: "You can't friend yourself" });
+app.post('/api/friends/:username', requireAuth, friendLimiter, requireIntent(['request', 'accept']), loadVisibleUser,
+  (req, res) => {
+    const { user: other, relationship } = req.other;
+    if (relationship === RELATION.SELF) return res.status(400).json({ error: "You can't friend yourself" });
 
-  const now = new Date().toISOString();
-  if (rel === 'incoming') {
-    db.prepare("UPDATE friendships SET status = 'accepted', responded_at = ? WHERE requester_id = ? AND addressee_id = ?")
-      .run(now, other.id, req.user.id);
-    return res.json({ relation: 'friends', result: 'accepted' });
-  }
-  if (intent === 'accept') {
-    return res.status(409).json({ error: `@${other.username} has no pending request to accept`, relation: rel });
-  }
-  if (rel === 'none') {
-    // Replace any old declined request between you (in either direction).
-    transaction(() => {
-      deleteFriendship(req.user.id, other.id);
-      db.prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'pending', ?)")
-        .run(req.user.id, other.id, now);
-    });
-    return res.status(201).json({ relation: 'outgoing', result: 'created' });
-  }
-  const error = {
-    friends: `You're already friends with @${other.username}`,
-    outgoing: 'Friend request already sent',
-    declined: `@${other.username} declined your friend request. You can't send another one yet.`,
-    blocked: `You've blocked @${other.username}. Unblock them first.`,
-  }[rel];
-  res.status(409).json({ error, relation: rel });
-});
+    if (relationship === RELATION.INCOMING) {
+      respondToRequest(other.id, req.user.id, STATUS.ACCEPTED);
+      return res.json({ relation: RELATION.FRIENDS, result: 'accepted' });
+    }
+    if (req.intent === 'accept') {
+      return res.status(409).json({ error: `@${other.username} has no pending request to accept`, relation: relationship });
+    }
+    if (relationship === RELATION.NONE) {
+      // Replaces any old declined request between you (in either direction).
+      replaceFriendship(req.user.id, other.id, STATUS.PENDING);
+      return res.status(201).json({ relation: RELATION.OUTGOING, result: 'created' });
+    }
+    const error = {
+      [RELATION.FRIENDS]: `You're already friends with @${other.username}`,
+      [RELATION.OUTGOING]: 'Friend request already sent',
+      [RELATION.DECLINED]: `@${other.username} declined your friend request. You can't send another one yet.`,
+      [RELATION.BLOCKED]: `You've blocked @${other.username}. Unblock them first.`,
+    }[relationship];
+    res.status(409).json({ error, relation: relationship });
+  });
 
 // Cancel your request, decline theirs, or unfriend. Optional body
 // { intent: 'cancel' | 'decline' | 'unfriend' } makes the request fail with 409 unless the relation
 // still matches (so a stale "Cancel request" button can't unfriend someone who has since accepted).
 // Declining keeps the row as 'declined', so the requester can't ask again straight away; the other
 // two delete it. 404 if there was nothing to remove. Blocks are removed with DELETE /api/blocks.
-const DELETE_INTENTS = { cancel: 'outgoing', decline: 'incoming', unfriend: 'friends' };
-app.delete('/api/friends/:username', requireAuth, (req, res) => {
-  const intent = intentOf(req);
-  if (intent && !DELETE_INTENTS[intent]) {
-    return res.status(400).json({ error: "intent must be 'cancel', 'decline' or 'unfriend'" });
-  }
-  const found = visibleUser(req, res);
-  if (!found) return;
-  const { user: other, rel } = found;
-  if (rel === 'self') return res.status(400).json({ error: "You can't unfriend yourself" });
-  if (rel === 'none' || rel === 'declined') {
-    return res.status(404).json({ error: 'No friendship or request to remove', relation: rel });
-  }
-  if (rel === 'blocked' || (intent && DELETE_INTENTS[intent] !== rel)) {
-    return res.status(409).json({ error: 'That friendship has changed. Refresh and try again.', relation: rel });
-  }
-  if (rel === 'incoming') {
-    db.prepare("UPDATE friendships SET status = 'declined', responded_at = ? WHERE requester_id = ? AND addressee_id = ?")
-      .run(new Date().toISOString(), other.id, req.user.id);
-    return res.json({ relation: 'none', result: 'declined' });
-  }
-  deleteFriendship(req.user.id, other.id);
-  res.json({ relation: 'none', result: 'removed' });
-});
+const DELETE_INTENTS = { cancel: RELATION.OUTGOING, decline: RELATION.INCOMING, unfriend: RELATION.FRIENDS };
+app.delete('/api/friends/:username', requireAuth, requireIntent(Object.keys(DELETE_INTENTS), { optional: true }),
+  loadVisibleUser, (req, res) => {
+    const { user: other, relationship } = req.other;
+    if (relationship === RELATION.SELF) return res.status(400).json({ error: "You can't unfriend yourself" });
+    if (relationship === RELATION.NONE || relationship === RELATION.DECLINED) {
+      return res.status(404).json({ error: 'No friendship or request to remove', relation: relationship });
+    }
+    if (relationship === RELATION.BLOCKED || (req.intent && DELETE_INTENTS[req.intent] !== relationship)) {
+      return res.status(409).json({ error: 'That friendship has changed. Refresh and try again.', relation: relationship });
+    }
+    if (relationship === RELATION.INCOMING) {
+      respondToRequest(other.id, req.user.id, STATUS.DECLINED);
+      return res.json({ relation: RELATION.NONE, result: 'declined' });
+    }
+    deleteFriendship(req.user.id, other.id);
+    res.json({ relation: RELATION.NONE, result: 'removed' });
+  });
 
 // Block a user: ends any friendship or request between you, and from then on they can't see your
 // profile, find you in searches or send you requests (to them it looks like you don't exist).
 // 201 when blocked, 200 if you had already blocked them.
-app.post('/api/blocks/:username', requireAuth, blockLimiter, (req, res) => {
-  const found = visibleUser(req, res);
-  if (!found) return;
-  const { user: other, rel } = found;
-  if (rel === 'self') return res.status(400).json({ error: "You can't block yourself" });
-  if (rel === 'blocked') return res.json({ relation: 'blocked', result: 'unchanged' });
-  transaction(() => {
-    deleteFriendship(req.user.id, other.id);
-    db.prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'blocked', ?)")
-      .run(req.user.id, other.id, new Date().toISOString());
-  });
-  res.status(201).json({ relation: 'blocked', result: 'blocked' });
+app.post('/api/blocks/:username', requireAuth, blockLimiter, loadVisibleUser, (req, res) => {
+  const { user: other, relationship } = req.other;
+  if (relationship === RELATION.SELF) return res.status(400).json({ error: "You can't block yourself" });
+  if (relationship === RELATION.BLOCKED) return res.json({ relation: RELATION.BLOCKED, result: 'unchanged' });
+  replaceFriendship(req.user.id, other.id, STATUS.BLOCKED);
+  res.status(201).json({ relation: RELATION.BLOCKED, result: 'blocked' });
 });
 
 // Unblock a user. 404 if you hadn't blocked them.
-app.delete('/api/blocks/:username', requireAuth, (req, res) => {
-  const found = visibleUser(req, res);
-  if (!found) return;
+app.delete('/api/blocks/:username', requireAuth, loadVisibleUser, (req, res) => {
+  const { user: other, relationship } = req.other;
   const { changes } = db.prepare(
-    "DELETE FROM friendships WHERE requester_id = ? AND addressee_id = ? AND status = 'blocked'"
-  ).run(req.user.id, found.user.id);
-  if (!changes) return res.status(404).json({ error: `You haven't blocked @${found.user.username}`, relation: found.rel });
-  res.json({ relation: 'none', result: 'unblocked' });
+    'DELETE FROM friendships WHERE requester_id = ? AND addressee_id = ? AND status = ?'
+  ).run(req.user.id, other.id, STATUS.BLOCKED);
+  if (!changes) return res.status(404).json({ error: `You haven't blocked @${other.username}`, relation: relationship });
+  res.json({ relation: RELATION.NONE, result: 'unblocked' });
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

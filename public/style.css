@@ -13,6 +13,9 @@
   --danger: #c42b41;
   --danger-text: #ffffff;
   --like: #d0204f;
+  --mark-bg: #ffe66d;
+  --mark-text: #16181c;
+  --content-width: 620px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -28,6 +31,8 @@
     --danger: #f4566c;
     --danger-text: #0f1419;
     --like: #ff3d92;
+    --mark-bg: #6b5600;
+    --mark-text: #fff6c2;
   }
 }
 
@@ -85,7 +90,7 @@ a:hover { text-decoration: underline; }
 }
 
 .nav-inner {
-  max-width: 620px;
+  max-width: var(--content-width);
   margin: 0 auto;
   padding: 4px 16px;
   display: flex;
@@ -133,7 +138,7 @@ a:hover { text-decoration: underline; }
 /* ---------- Layout ---------- */
 
 main {
-  max-width: 620px;
+  max-width: var(--content-width);
   margin: 0 auto;
   padding: 16px;
 }
@@ -272,17 +277,20 @@ button.link:hover { color: var(--text); }
 
 /* ---------- Posts ---------- */
 
-.post-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 4px; }
-.post-head .author { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+/* The "@author · time" line of posts and comments. */
+.meta-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 4px; }
+.meta-head .author { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
 .timestamp { font-size: 0.85rem; font-weight: 400; min-height: 32px; padding: 4px 6px; }
-.post-body { margin: 6px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Text people wrote (posts and comments): keep their line breaks, and break long words. */
+.user-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.post-body { margin: 6px 0 10px; }
 
 .post-actions { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-left: -8px; }
 .like-btn.liked { color: var(--like); }
 
 .load-more { text-align: center; margin-bottom: 12px; list-style: none; }
 
-mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
+mark { background: var(--mark-bg); color: var(--mark-text); border-radius: 2px; }
 
 /* ---------- Profile / friends ---------- */
 
@@ -299,7 +307,7 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 .account-delete { display: grid; gap: 10px; }
 .account-delete button { justify-self: start; }
 
-.user-list { list-style: none; margin: 0; padding: 0; }
+.user-list, .comment-list { list-style: none; margin: 0; padding: 0; }
 
 .user-row {
   display: flex;
@@ -322,11 +330,10 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
   border-top: 1px solid var(--border);
 }
 
-.comment-list { list-style: none; margin: 0; padding: 0; }
 .comment { padding: 8px 0 8px 12px; border-left: 2px solid var(--border); margin-bottom: 6px; }
-.comment .post-head { font-size: 0.92rem; }
+.comment .meta-head { font-size: 0.92rem; }
 .comment-delete { margin-left: auto; font-size: 0.85rem; }
-.comment-body { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.comment-body { margin: 2px 0 0; }
 .comment-status { margin: 4px 0 8px; font-size: 0.9rem; }
 
 .comment-form { display: flex; gap: 8px; margin-top: 8px; }
