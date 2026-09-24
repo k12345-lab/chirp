@@ -28,7 +28,7 @@ The database is a single file at `data/chirp.db`, created automatically on first
 | Variable    | Default          | Purpose                                    |
 |-------------|------------------|--------------------------------------------|
 | `PORT`      | `3000`           | Port to listen on                          |
-| `DB_PATH`   | `data/chirp.db`  | Location of the SQLite database file       |
+| `DB_PATH`   | `data/chirp.db`  | Location of the SQLite database file (its folder is created if missing) |
 | `NODE_ENV`  | —                | Set to `production` when served over HTTPS so the session cookie is marked `Secure` |
 
 ## Project layout
@@ -45,3 +45,5 @@ public/          Frontend (plain HTML/CSS/JS, hash-based routing)
 - **Sessions** are random tokens stored in the `sessions` table and sent as an `HttpOnly`, `SameSite=Strict` cookie. They last 30 days.
 - **Friendships** are one row per pair of users. The row is `pending` until the other person accepts it, and then it becomes `accepted`. Declining, canceling, or unfriending deletes the row.
 - **Privacy:** you can only see, search, like, and comment on posts from yourself and your accepted friends.
+- **Friend actions state their intent.** `POST /api/friends/:username` takes `{ "intent": "request" | "accept" }` and `DELETE` takes an optional `{ "intent": "cancel" | "decline" | "unfriend" }`. A request that no longer matches the relationship (for example, accepting a request that was already canceled) gets `409` and changes nothing. A new request returns `201`, an accepted one `200`, and removing a friendship that doesn't exist returns `404`.
+- **Lists are paginated.** The feed, profile posts, and `/api/users` return one page at a time plus a `nextCursor`. Pass it back as `?cursor=` to get the next page, and the UI shows a "Load more" button. `/api/users?relation=none` filters in SQL, so "Find people" lists everyone you could still add.

@@ -142,6 +142,9 @@ button.link {
 }
 
 .error { color: var(--danger); min-height: 1.2em; margin: 8px 0 0; font-size: 0.9rem; }
+/* Inline errors next to actions take no space until there's something to show. */
+.error.compact:empty { display: none; }
+.actions .error { margin: 0; align-self: center; }
 
 /* ---------- Auth ---------- */
 
@@ -174,6 +177,8 @@ button.link {
 
 .post-actions { display: flex; gap: 18px; }
 .like-btn.liked { color: var(--like); }
+
+.load-more { text-align: center; margin-bottom: 12px; }
 
 mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 
