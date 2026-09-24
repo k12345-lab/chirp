@@ -9,7 +9,8 @@ A tiny Twitter-like app for a small group of friends.
 - Search bar filters the feed by post text or username
 - Like posts, delete your own posts, and view profile pages
 - Comment on posts you can see (yours and your friends'); delete your own comments, or any comment on your own posts
-- Download your data or delete your account (Account & privacy, linked from your profile)
+- Download your data, log out on every device, or delete your account (Account & privacy, linked from your profile)
+- Accessible UI: labelled fields, keyboard focus management, screen reader announcements, WCAG AA contrast in light and dark mode, and a layout that works down to 360px wide
 
 ## Running it
 
