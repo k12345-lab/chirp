@@ -3,12 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
   <title>Chirp</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <a class="skip-link" href="#app">Skip to content</a>
   <header id="nav" hidden></header>
-  <main id="app"></main>
+  <main id="app" tabindex="-1"></main>
+  <div id="status" class="visually-hidden" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 </html>

@@ -1,13 +1,18 @@
+/* Colours meet WCAG AA in both themes: 4.5:1 for text (including white on the accent in light
+   mode and dark text on it in dark mode), 3:1 for input borders and focus rings. */
 :root {
+  color-scheme: light dark;
   --bg: #f5f7fa;
   --card: #ffffff;
   --text: #16181c;
   --muted: #5b6470;
   --border: #e1e5ea;
-  --accent: #1d8cf0;
+  --input-border: #838d99;
+  --accent: #0b6bcb;
   --accent-text: #ffffff;
-  --danger: #d6334a;
-  --like: #e0245e;
+  --danger: #c42b41;
+  --danger-text: #ffffff;
+  --like: #d0204f;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -17,9 +22,12 @@
     --text: #e7e9ea;
     --muted: #8b98a5;
     --border: #2f3b47;
+    --input-border: #66768a;
     --accent: #1d9bf0;
+    --accent-text: #0f1419;
     --danger: #f4566c;
-    --like: #f91880;
+    --danger-text: #0f1419;
+    --like: #ff3d92;
   }
 }
 
@@ -36,6 +44,36 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Headings and messages only get focus from the app (after navigation), not from Tab. */
+[tabindex="-1"]:focus { outline: none; }
+
+/* Hidden on screen but still read by screen readers. */
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  left: 8px;
+  top: -100px;
+  z-index: 20;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+.skip-link:focus { top: 8px; }
+
 /* ---------- Nav ---------- */
 
 #nav {
@@ -49,17 +87,35 @@ a:hover { text-decoration: underline; }
 .nav-inner {
   max-width: 620px;
   margin: 0 auto;
-  padding: 10px 16px;
+  padding: 4px 16px;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 18px;
+  column-gap: 12px;
 }
 
-.brand { font-weight: 800; font-size: 1.2rem; color: var(--text); margin-right: auto; }
+.brand { font-weight: 800; font-size: 1.2rem; color: var(--text); margin-right: auto; padding: 6px 0; }
 .brand:hover { text-decoration: none; }
 
-.nav-link { color: var(--muted); font-weight: 600; position: relative; }
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 4px;
+  color: var(--muted);
+  font-weight: 600;
+}
 .nav-link.active { color: var(--text); }
+
+/* Long usernames are cut short rather than pushing the nav off screen. */
+.nav-user {
+  display: inline-block;
+  max-width: 10rem;
+  line-height: 40px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .badge {
   display: inline-block;
@@ -68,7 +124,7 @@ a:hover { text-decoration: underline; }
   margin-left: 4px;
   border-radius: 9px;
   background: var(--danger);
-  color: #fff;
+  color: var(--danger-text);
   font-size: 0.72rem;
   text-align: center;
   line-height: 18px;
@@ -92,9 +148,13 @@ main {
 
 h1, h2 { margin: 0 0 12px; }
 h2 { font-size: 1.05rem; }
+.view-title { font-size: 1.35rem; }
 
 .muted { color: var(--muted); }
 .empty { color: var(--muted); text-align: center; padding: 24px 0; }
+.flush { margin: 0; }
+.section-intro { margin: 0 0 10px; }
+.load-error-actions { margin: 10px 0 0; }
 
 /* ---------- Forms ---------- */
 
@@ -103,14 +163,29 @@ input, textarea {
   font: inherit;
   color: var(--text);
   background: var(--bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--input-border);
   border-radius: 8px;
   padding: 10px 12px;
 }
 
 input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--danger); }
 
 textarea { resize: vertical; min-height: 80px; }
+
+label { font-weight: 600; }
+.field { display: grid; gap: 4px; }
+.hint { margin: 0; color: var(--muted); font-size: 0.85rem; }
+
+.checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  font-weight: 400;
+  cursor: pointer;
+}
+.checkbox input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
 
 button {
   font: inherit;
@@ -118,6 +193,7 @@ button {
   cursor: pointer;
   border: 1px solid transparent;
   border-radius: 999px;
+  min-height: 40px;
   padding: 7px 16px;
   background: var(--accent);
   color: var(--accent-text);
@@ -128,28 +204,34 @@ button:disabled { opacity: 0.5; cursor: default; }
 button.secondary {
   background: transparent;
   color: var(--text);
-  border-color: var(--border);
+  border-color: var(--input-border);
 }
 
-button.danger { background: transparent; color: var(--danger); border-color: var(--border); }
+button.danger { background: transparent; color: var(--danger); border-color: var(--input-border); }
 
 a.button {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
   font-weight: 600;
-  border: 1px solid var(--border);
+  border: 1px solid var(--input-border);
   border-radius: 999px;
   padding: 7px 16px;
   color: var(--text);
 }
 a.button:hover { text-decoration: none; }
 
+/* Text-style buttons (Like, Delete, ...) still get a comfortable tap target. */
 button.link {
   background: none;
   border: none;
-  padding: 0;
+  border-radius: 8px;
+  min-height: 36px;
+  padding: 6px 8px;
   color: var(--muted);
   font-weight: 600;
 }
+button.link:hover { color: var(--text); }
 
 .error { color: var(--danger); min-height: 1.2em; margin: 8px 0 0; font-size: 0.9rem; }
 /* Inline errors next to actions take no space until there's something to show. */
@@ -160,7 +242,7 @@ button.link {
 
 .auth { max-width: 360px; margin: 60px auto; }
 .auth h1 { text-align: center; font-size: 2rem; }
-.auth form { display: grid; gap: 10px; }
+.auth form { display: grid; gap: 12px; }
 .auth .switch { text-align: center; margin-top: 14px; }
 
 .privacy-notice { font-size: 0.85rem; margin-top: 14px; }
@@ -171,44 +253,57 @@ button.link {
 
 .compose-footer {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   align-items: center;
-  gap: 12px;
+  gap: 8px 12px;
   margin-top: 8px;
+}
+.shortcut-hint { margin-right: auto; }
+/* Touch screens have no keyboard shortcut to show. */
+@media (hover: none) and (pointer: coarse) {
+  .shortcut-hint { display: none; }
 }
 
 .counter { color: var(--muted); font-size: 0.85rem; }
-.counter.over { color: var(--danger); }
+.counter.over { color: var(--danger); font-weight: 600; }
 
 .search { margin-bottom: 12px; }
 
 /* ---------- Posts ---------- */
 
-.post-head { display: flex; align-items: baseline; gap: 8px; }
-.post-head .author { font-weight: 700; color: var(--text); }
-.post-head time { color: var(--muted); font-size: 0.85rem; }
+.post-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 4px; }
+.post-head .author { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+.timestamp { font-size: 0.85rem; font-weight: 400; min-height: 32px; padding: 4px 6px; }
 .post-body { margin: 6px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.post-actions { display: flex; gap: 18px; }
+.post-actions { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-left: -8px; }
 .like-btn.liked { color: var(--like); }
 
-.load-more { text-align: center; margin-bottom: 12px; }
+.load-more { text-align: center; margin-bottom: 12px; list-style: none; }
 
 mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 
 /* ---------- Profile / friends ---------- */
 
-.profile-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.profile-head h1 { margin: 0; }
-.profile-head .actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+.profile-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+.profile-name { min-width: 0; }
+.profile-head h1 { margin: 0; overflow-wrap: anywhere; }
+.profile-details { margin: 4px 0 0; }
+.profile-head .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+.find-status { margin: 0 0 4px; }
 
 /* ---------- Account ---------- */
 
 .account-delete { display: grid; gap: 10px; }
 .account-delete button { justify-self: start; }
 
+.user-list { list-style: none; margin: 0; padding: 0; }
+
 .user-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
@@ -216,8 +311,8 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
   border-top: 1px solid var(--border);
 }
 .user-row:first-of-type { border-top: none; }
-.user-row .actions { display: flex; gap: 6px; }
-.user-row a { font-weight: 600; color: var(--text); }
+.user-row .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.user-row a { font-weight: 600; color: var(--text); overflow-wrap: anywhere; padding: 8px 0; }
 
 /* ---------- Comments ---------- */
 
@@ -227,6 +322,7 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
   border-top: 1px solid var(--border);
 }
 
+.comment-list { list-style: none; margin: 0; padding: 0; }
 .comment { padding: 8px 0 8px 12px; border-left: 2px solid var(--border); margin-bottom: 6px; }
 .comment .post-head { font-size: 0.92rem; }
 .comment-delete { margin-left: auto; font-size: 0.85rem; }
@@ -234,5 +330,17 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 .comment-status { margin: 4px 0 8px; font-size: 0.9rem; }
 
 .comment-form { display: flex; gap: 8px; margin-top: 8px; }
-.comment-form input { padding: 7px 10px; }
+.comment-form input { padding: 7px 10px; min-width: 0; }
+.comment-meta { text-align: right; margin-top: 4px; }
 .comment-note { margin: 6px 0 0; font-size: 0.8rem; }
+
+/* ---------- Small screens ---------- */
+
+@media (max-width: 400px) {
+  main { padding: 12px; }
+  .nav-inner { padding: 4px 12px; column-gap: 6px; }
+  .nav-inner button.link { padding: 6px 4px; }
+  .nav-link { padding: 0 2px; }
+  .nav-user { max-width: 5rem; }
+  .profile-head h1 { font-size: 1.5rem; }
+}
