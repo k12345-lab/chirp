@@ -39,11 +39,27 @@ In production, serve Chirp over HTTPS. If you put it behind a reverse proxy, the
 ## Project layout
 
 ```
-server.js            Express server: auth, posts, likes, friends API
-db.js                SQLite connection and schema
-common-passwords.js  Short list of common passwords refused at signup
-public/              Frontend (plain HTML/CSS/JS, hash-based routing)
+server.js              Entry point: opens the database, starts the server, closes cleanly on exit
+app.js                 createApp(): security headers, static files, middleware, mounts the routers
+config.js              Shared limits, friendship statuses, relation names, client config
+db.js                  initDb()/closeDb(), schema migrations (PRAGMA user_version), hourly cleanup
+auth.js                Password hashing, session cookies, loadSession and requireAuth middleware
+common-passwords.js    Short list of common passwords refused at signup
+queries/               SQL, one module per area (users, posts, comments, friends, sessions);
+                       statements are prepared once when the module loads
+routes/                express.Router()s: auth, account (/api/me), posts, users, friends
+middleware/            CSRF check, rate limiters, input validation, loaders, error handlers
+public/                Frontend: plain HTML/CSS and ES modules, hash-based routing
+  app.js               Entry module (loaded with <script type="module">)
+  router.js            Picks the view for the URL hash; shows the login form on a 401
+  state.js             Current user, view lifecycle, navigation
+  api.js, config.js    fetch wrapper; limits loaded from /api/config
+  dom.js, util.js      DOM builder and small helpers
+  components.js        Widgets shared by the views
+  views/               One module per screen, plus shared post and friend-action widgets
 ```
+
+The database schema is versioned with `PRAGMA user_version`. On startup `initDb()` runs any migrations in `db.js` that the file hasn't had yet, each in its own transaction, so upgrading keeps your data (including logged-in sessions). A database from a newer version of Chirp is refused rather than opened. All timestamps are stored as ISO 8601 UTC text (e.g. `2025-01-31T09:05:00.000Z`).
 
 ## How it works
 
@@ -53,7 +69,7 @@ public/              Frontend (plain HTML/CSS/JS, hash-based routing)
 - **Privacy:** you can only see, search, like, and comment on posts from yourself and your accepted friends. A comment is shown to its author, the post's author, and the commenter's accepted friends, so people who aren't friends with the commenter never see it (different readers of the same post can see different comments).
 - **Friend actions state their intent.** `POST /api/friends/:username` takes `{ "intent": "request" | "accept" }` and `DELETE` takes an optional `{ "intent": "cancel" | "decline" | "unfriend" }`. A request that no longer matches the relationship (for example, accepting a request that was already canceled) gets `409` and changes nothing. A new request returns `201`, an accepted one `200`, and removing a friendship that doesn't exist returns `404`. `POST /api/blocks/:username` blocks someone and `DELETE /api/blocks/:username` unblocks them.
 - **Lists are paginated.** The feed, profile posts, and `/api/users` return one page at a time plus a `nextCursor`. Pass it back as `?cursor=` to get the next page, and the UI shows a "Load more" button. `/api/users` matches usernames by prefix, 10 per page; `?relation=none` (people you could still add) filters in SQL. A search that can return strangers needs at least 3 characters.
-- **Shared limits.** `GET /api/config` (no login needed) returns the limits and names the frontend shares with the server, such as the maximum post and comment length, the signup rules and the `relation` values, so they're defined only in `server.js`.
+- **Shared limits.** `GET /api/config` (no login needed) returns the limits and names the frontend shares with the server, such as the maximum post and comment length, the signup rules and the `relation` values, so they're defined only in `config.js`.
 - **Your account.** `GET /api/me/export` downloads your data as JSON (account, posts, your comments, likes, friendships). `DELETE /api/me` with `{ "password": "..." }` deletes your account; the database's `ON DELETE CASCADE` removes your sessions, posts (with the likes and comments on them), comments, likes and friendships.
 
 ## Security notes
