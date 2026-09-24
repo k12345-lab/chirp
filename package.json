@@ -1,0 +1,17 @@
+{
+  "name": "chirp",
+  "version": "1.0.0",
+  "description": "A tiny Twitter-like app for a small group of friends",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
