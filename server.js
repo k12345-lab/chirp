@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { db } from './db.js';
+import { db, checkpoint } from './db.js';
 import { COMMON_PASSWORDS } from './common-passwords.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -22,7 +22,11 @@ const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_LENGTH = 200;
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const POSTS_PAGE_SIZE = 50;
-const USERS_PAGE_SIZE = 50;
+const USERS_PAGE_SIZE = 10;
+// Searches that can list strangers must give at least this many leading characters of a username.
+const MIN_USER_SEARCH_LENGTH = 3;
+// After someone declines your friend request, you can't ask them again for this long.
+const DECLINE_COOLDOWN_MS = 30 * DAY;
 // Session cookies are Secure unless COOKIE_SECURE=false; see cookieMode().
 const COOKIE_SECURE = process.env.COOKIE_SECURE !== 'false';
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -238,6 +242,19 @@ const loginUserLimiter = limiter(15 * MINUTE, 10, 'failed logins for this accoun
 const postLimiter = limiter(15 * MINUTE, 30, 'posts', { keyGenerator: byUser });
 const commentLimiter = limiter(15 * MINUTE, 60, 'comments', { keyGenerator: byUser });
 const friendLimiter = limiter(HOUR, 50, 'friend requests', { keyGenerator: byUser });
+const blockLimiter = limiter(HOUR, 50, 'blocks', { keyGenerator: byUser });
+// Searching and looking up usernames reveal who has an account, so they're limited too. Only
+// lookups of names that don't exist (404) count, so browsing friends' profiles is unaffected.
+const userSearchLimiter = limiter(15 * MINUTE, 120, 'user searches', { keyGenerator: byUser });
+const userLookupLimiter = limiter(15 * MINUTE, 60, 'lookups of unknown users', {
+  keyGenerator: byUser,
+  skipSuccessfulRequests: true,
+});
+const deleteAccountLimiter = limiter(15 * MINUTE, 5, 'failed attempts to delete your account', {
+  keyGenerator: byUser,
+  skipSuccessfulRequests: true,
+});
+const exportLimiter = limiter(HOUR, 10, 'data exports', { keyGenerator: byUser });
 
 // ---------- Input validation ----------
 
@@ -266,16 +283,65 @@ const FRIEND_IDS_SQL = `
   WHERE status = 'accepted' AND (requester_id = $me OR addressee_id = $me)
 `;
 
-// Returns 'self' | 'friends' | 'outgoing' | 'incoming' | 'none'.
+// A comment is shown to its author, the post's owner, and the commenter's accepted friends
+// (so never to someone the commenter isn't friends with). Needs aliases c (comment), p (post).
+const COMMENT_VISIBLE_SQL = `(c.user_id = $me OR p.user_id = $me OR c.user_id IN (${FRIEND_IDS_SQL}))`;
+
+// A declined request stops the requester from asking again until this ISO time has passed.
+const declinedSince = () => new Date(Date.now() - DECLINE_COOLDOWN_MS).toISOString();
+
+// Relation of $me to user alias u, given the friendship row alias f (LEFT JOINed). Must match
+// relation() below.
+const RELATION_SQL = `
+  CASE
+    WHEN f.status IS NULL THEN 'none'
+    WHEN f.status = 'accepted' THEN 'friends'
+    WHEN f.status = 'pending' THEN CASE WHEN f.requester_id = $me THEN 'outgoing' ELSE 'incoming' END
+    WHEN f.status = 'blocked' THEN CASE WHEN f.requester_id = $me THEN 'blocked' ELSE 'blocked-by' END
+    WHEN f.requester_id = $me AND f.responded_at > $declinedSince THEN 'declined'
+    ELSE 'none'
+  END
+`;
+
+// Returns 'self' | 'friends' | 'outgoing' | 'incoming' | 'declined' (they declined your request
+// recently) | 'blocked' (you blocked them) | 'blocked-by' (they blocked you) | 'none'.
+// Someone who declined a request sees 'none' and may send a request themselves.
+// 'blocked-by' is never sent to the client: routes answer as if the user didn't exist.
 function relation(meId, otherId) {
   if (meId === otherId) return 'self';
   const row = db.prepare(`
-    SELECT requester_id, status FROM friendships
+    SELECT requester_id, status, responded_at FROM friendships
     WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
   `).get(meId, otherId, otherId, meId);
   if (!row) return 'none';
-  if (row.status === 'accepted') return 'friends';
-  return row.requester_id === meId ? 'outgoing' : 'incoming';
+  const mine = row.requester_id === meId;
+  switch (row.status) {
+    case 'accepted': return 'friends';
+    case 'pending': return mine ? 'outgoing' : 'incoming';
+    case 'blocked': return mine ? 'blocked' : 'blocked-by';
+    default: return mine && row.responded_at > declinedSince() ? 'declined' : 'none';
+  }
+}
+
+// Remove whatever row exists between two users (both directions).
+function deleteFriendship(aId, bId) {
+  db.prepare(`
+    DELETE FROM friendships
+    WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
+  `).run(aId, bId, bId, aId);
+}
+
+// Run `fn` inside a transaction.
+function transaction(fn) {
+  db.exec('BEGIN');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
 }
 
 function findUser(username) {
@@ -307,7 +373,7 @@ function visiblePosts(meId, { authorId = null, search = null, cursor = null } = 
     SELECT p.id, p.user_id, p.body, p.created_at, u.username,
       (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
       EXISTS (SELECT 1 FROM likes l WHERE l.post_id = p.id AND l.user_id = $me) AS liked,
-      (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+      (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id AND ${COMMENT_VISIBLE_SQL}) AS comment_count
     FROM posts p JOIN users u ON u.id = p.user_id
     WHERE (p.user_id = $me OR p.user_id IN (${FRIEND_IDS_SQL}))
       AND ($author IS NULL OR p.user_id = $author)
@@ -418,6 +484,73 @@ app.get('/api/me', requireAuth, (req, res) => {
   res.json({ username: req.user.username, pendingRequests: pending });
 });
 
+// Delete your account. Body: { password }. Everything else you created (sessions, posts and the
+// comments and likes on them, your comments, likes and friendships) goes with it via ON DELETE
+// CASCADE, and secure_delete plus a checkpoint make sure the text doesn't linger in the file.
+app.delete('/api/me', requireAuth, deleteAccountLimiter, async (req, res) => {
+  const password = String(req.body?.password ?? '');
+  const { password_hash } = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+  // 403 rather than 401, which would mean "not logged in".
+  if (!(await verifyPassword(password, password_hash))) {
+    return res.status(403).json({ error: 'Incorrect password' });
+  }
+  db.prepare('DELETE FROM users WHERE id = ?').run(req.user.id);
+  checkpoint();
+  clearSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+// Download everything Chirp stores about you, as JSON. Comments other people wrote on your
+// posts are theirs, so they aren't included (only their count).
+app.get('/api/me/export', requireAuth, exportLimiter, (req, res) => {
+  const me = req.user.id;
+  const user = db.prepare('SELECT username, created_at FROM users WHERE id = ?').get(me);
+  const posts = db.prepare(`
+    SELECT p.id, p.body, p.created_at,
+      (SELECT COUNT(*) FROM likes l WHERE l.post_id = p.id) AS like_count,
+      (SELECT COUNT(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+    FROM posts p WHERE p.user_id = ? ORDER BY p.created_at, p.id
+  `).all(me);
+  const comments = db.prepare(`
+    SELECT c.id, c.post_id, u.username AS post_author, c.body, c.created_at
+    FROM comments c JOIN posts p ON p.id = c.post_id JOIN users u ON u.id = p.user_id
+    WHERE c.user_id = ? ORDER BY c.created_at, c.id
+  `).all(me);
+  const likes = db.prepare(`
+    SELECT l.post_id, u.username AS post_author
+    FROM likes l JOIN posts p ON p.id = l.post_id JOIN users u ON u.id = p.user_id
+    WHERE l.user_id = ? ORDER BY l.post_id
+  `).all(me);
+  // Leave out other people's blocks of you: those are their data, not yours.
+  const friendships = db.prepare(`
+    SELECT u.username, f.requester_id, f.status, f.created_at, f.responded_at
+    FROM friendships f
+    JOIN users u ON u.id = CASE WHEN f.requester_id = $me THEN f.addressee_id ELSE f.requester_id END
+    WHERE (f.requester_id = $me OR f.addressee_id = $me) AND NOT (f.status = 'blocked' AND f.addressee_id = $me)
+    ORDER BY u.username COLLATE NOCASE
+  `).all({ me });
+
+  res.attachment(`chirp-${user.username}-${new Date().toISOString().slice(0, 10)}.json`);
+  res.json({
+    exportedAt: new Date().toISOString(),
+    account: { username: user.username, joined: user.created_at },
+    posts: posts.map((p) => ({
+      id: p.id, body: p.body, createdAt: p.created_at, likeCount: p.like_count, commentCount: p.comment_count,
+    })),
+    comments: comments.map((c) => ({
+      id: c.id, postId: c.post_id, postAuthor: c.post_author, body: c.body, createdAt: c.created_at,
+    })),
+    likes: likes.map((l) => ({ postId: l.post_id, postAuthor: l.post_author })),
+    friendships: friendships.map((f) => ({
+      username: f.username,
+      status: f.status,
+      direction: f.requester_id === me ? 'sent' : 'received',
+      createdAt: f.created_at,
+      respondedAt: f.responded_at,
+    })),
+  });
+});
+
 // ---------- Post routes ----------
 
 app.get('/api/feed', requireAuth, (req, res) => {
@@ -471,7 +604,8 @@ app.delete('/api/posts/:id/like', requireAuth, (req, res) => {
 
 // ---------- Comment routes ----------
 
-// Comments on a post are visible to anyone who can see the post, oldest first.
+// Comments on a post, oldest first. Only those you may see (COMMENT_VISIBLE_SQL) are returned:
+// yours, all of them on your own posts, and otherwise only those by your friends.
 app.get('/api/posts/:id/comments', requireAuth, (req, res) => {
   const postId = Number(req.params.id);
   if (!canSeePost(req.user.id, postId)) return res.status(404).json({ error: 'Post not found' });
@@ -480,9 +614,9 @@ app.get('/api/posts/:id/comments', requireAuth, (req, res) => {
     FROM comments c
     JOIN users u ON u.id = c.user_id
     JOIN posts p ON p.id = c.post_id
-    WHERE c.post_id = ?
+    WHERE c.post_id = $post AND ${COMMENT_VISIBLE_SQL}
     ORDER BY c.created_at, c.id
-  `).all(postId);
+  `).all({ post: postId, me: req.user.id });
   res.json(rows.map((c) => ({
     id: c.id,
     body: c.body,
@@ -518,37 +652,39 @@ app.delete('/api/comments/:id', requireAuth, (req, res) => {
 
 // ---------- User & friend routes ----------
 
-// One page of other users, alphabetically. `relation` (optional) filters in SQL, before the
-// page limit, so e.g. "Find people" isn't starved by friends. `cursor` is the last username seen.
-app.get('/api/users', requireAuth, (req, res) => {
+// One page of other users whose username starts with `q`, alphabetically. `relation` (optional)
+// filters in SQL, before the page limit, so e.g. "Find people" isn't starved by friends. `cursor`
+// is the last username seen. To keep the user list from being walked, a search that can return
+// strangers (no relation filter, or 'none') needs at least MIN_USER_SEARCH_LENGTH characters.
+// People who blocked you are never listed.
+const USER_RELATION_FILTERS = ['none', 'friends', 'outgoing', 'incoming', 'declined', 'blocked'];
+app.get('/api/users', requireAuth, userSearchLimiter, (req, res) => {
   const q = searchQuery(req, res);
   if (q === undefined) return;
   const rel = req.query.relation ? String(req.query.relation) : null;
-  if (rel && !['none', 'friends', 'outgoing', 'incoming'].includes(rel)) {
+  if (rel && !USER_RELATION_FILTERS.includes(rel)) {
     return res.status(400).json({ error: 'Unknown relation filter' });
+  }
+  if ((!rel || rel === 'none') && q.length < MIN_USER_SEARCH_LENGTH) {
+    return res.status(400).json({ error: `Type at least ${MIN_USER_SEARCH_LENGTH} characters of a username` });
   }
   const rows = db.prepare(`
     SELECT username, relation FROM (
-      SELECT u.username,
-        CASE
-          WHEN f.status IS NULL THEN 'none'
-          WHEN f.status = 'accepted' THEN 'friends'
-          WHEN f.requester_id = $me THEN 'outgoing'
-          ELSE 'incoming'
-        END AS relation
+      SELECT u.username, ${RELATION_SQL} AS relation
       FROM users u
       LEFT JOIN friendships f
         ON (f.requester_id = $me AND f.addressee_id = u.id) OR (f.requester_id = u.id AND f.addressee_id = $me)
       WHERE u.id != $me AND u.username LIKE $q ESCAPE '\\'
         AND ($after IS NULL OR u.username > $after)
     )
-    WHERE $rel IS NULL OR relation = $rel
+    WHERE relation != 'blocked-by' AND ($rel IS NULL OR relation = $rel)
     ORDER BY username COLLATE NOCASE
     LIMIT $limit
   `).all({
     me: req.user.id,
-    q: `%${escapeLike(q)}%`,
+    q: `${escapeLike(q)}%`,
     after: req.query.cursor ? String(req.query.cursor) : null,
+    declinedSince: declinedSince(),
     rel,
     limit: USERS_PAGE_SIZE + 1,
   });
@@ -557,22 +693,37 @@ app.get('/api/users', requireAuth, (req, res) => {
   res.json({ users, nextCursor: hasMore ? users.at(-1).username : null });
 });
 
-// Profile plus one page of posts. Pass `cursor` (the previous nextCursor) for later pages.
-app.get('/api/users/:username', requireAuth, (req, res) => {
+// The user named in the route and your relation to them, or null (after replying 404) if there's
+// no such user or they blocked you, so a block looks the same as a missing account.
+function visibleUser(req, res) {
   const user = findUser(req.params.username);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  const rel = relation(req.user.id, user.id);
+  const rel = user && relation(req.user.id, user.id);
+  if (!user || rel === 'blocked-by') {
+    res.status(404).json({ error: 'User not found' });
+    return null;
+  }
+  return { user, rel };
+}
+
+// Profile plus one page of posts. Pass `cursor` (the previous nextCursor) for later pages.
+// `joined` is the month you signed up ("YYYY-MM"), shown only to yourself and friends (else null).
+app.get('/api/users/:username', requireAuth, userLookupLimiter, (req, res) => {
+  const found = visibleUser(req, res);
+  if (!found) return;
+  const { user, rel } = found;
   const canSee = rel === 'self' || rel === 'friends';
   const page = canSee ? visiblePosts(req.user.id, { authorId: user.id, cursor: req.query.cursor }) : null;
   res.json({
     username: user.username,
-    joined: user.created_at,
+    joined: canSee ? user.created_at.slice(0, 7) : null,
     relation: rel,
     posts: page ? page.posts : null,
     nextCursor: page ? page.nextCursor : null,
   });
 });
 
+// Your friends, requests in both directions, and the people you've blocked. Requests you declined
+// and requests of yours that were declined are left out (a profile shows the latter).
 app.get('/api/friends', requireAuth, (req, res) => {
   const rows = db.prepare(`
     SELECT f.requester_id, f.status, u.username
@@ -581,11 +732,12 @@ app.get('/api/friends', requireAuth, (req, res) => {
     WHERE f.requester_id = $me OR f.addressee_id = $me
     ORDER BY u.username COLLATE NOCASE
   `).all({ me: req.user.id });
-  const result = { friends: [], incoming: [], outgoing: [] };
+  const result = { friends: [], incoming: [], outgoing: [], blocked: [] };
   for (const r of rows) {
+    const mine = r.requester_id === req.user.id;
     if (r.status === 'accepted') result.friends.push(r.username);
-    else if (r.requester_id === req.user.id) result.outgoing.push(r.username);
-    else result.incoming.push(r.username);
+    else if (r.status === 'pending') result[mine ? 'outgoing' : 'incoming'].push(r.username);
+    else if (r.status === 'blocked' && mine) result.blocked.push(r.username);
   }
   res.json(result);
 });
@@ -594,58 +746,104 @@ const intentOf = (req) => String(req.body?.intent ?? req.query.intent ?? '');
 
 // Body: { intent: 'request' | 'accept' }.
 // - request: 201 if a new request was created; 200 if they had already asked you (it's accepted);
-//   409 if you're already friends or already asked them.
+//   409 if you're already friends, already asked them, they declined you within the cooldown,
+//   or you blocked them.
 // - accept: 200 if their pending request was accepted; 409 if there is no request to accept
 //   (e.g. they canceled it), so a stale "Accept" button never sends a new request.
+// 404 if the user doesn't exist or has blocked you.
 app.post('/api/friends/:username', requireAuth, friendLimiter, (req, res) => {
   const intent = intentOf(req);
   if (intent !== 'request' && intent !== 'accept') {
     return res.status(400).json({ error: "intent must be 'request' or 'accept'" });
   }
-  const other = findUser(req.params.username);
-  if (!other) return res.status(404).json({ error: 'User not found' });
-  const rel = relation(req.user.id, other.id);
+  const found = visibleUser(req, res);
+  if (!found) return;
+  const { user: other, rel } = found;
   if (rel === 'self') return res.status(400).json({ error: "You can't friend yourself" });
 
+  const now = new Date().toISOString();
   if (rel === 'incoming') {
-    db.prepare("UPDATE friendships SET status = 'accepted' WHERE requester_id = ? AND addressee_id = ?")
-      .run(other.id, req.user.id);
+    db.prepare("UPDATE friendships SET status = 'accepted', responded_at = ? WHERE requester_id = ? AND addressee_id = ?")
+      .run(now, other.id, req.user.id);
     return res.json({ relation: 'friends', result: 'accepted' });
   }
   if (intent === 'accept') {
     return res.status(409).json({ error: `@${other.username} has no pending request to accept`, relation: rel });
   }
   if (rel === 'none') {
-    db.prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'pending', ?)")
-      .run(req.user.id, other.id, new Date().toISOString());
+    // Replace any old declined request between you (in either direction).
+    transaction(() => {
+      deleteFriendship(req.user.id, other.id);
+      db.prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'pending', ?)")
+        .run(req.user.id, other.id, now);
+    });
     return res.status(201).json({ relation: 'outgoing', result: 'created' });
   }
-  const error = rel === 'friends' ? `You're already friends with @${other.username}` : 'Friend request already sent';
+  const error = {
+    friends: `You're already friends with @${other.username}`,
+    outgoing: 'Friend request already sent',
+    declined: `@${other.username} declined your friend request. You can't send another one yet.`,
+    blocked: `You've blocked @${other.username}. Unblock them first.`,
+  }[rel];
   res.status(409).json({ error, relation: rel });
 });
 
-// Remove the friendship row. Optional body { intent: 'cancel' | 'decline' | 'unfriend' } makes the
-// request fail with 409 unless the relation still matches (so a stale "Cancel request" button
-// can't unfriend someone who has since accepted). 404 if there was nothing to remove.
+// Cancel your request, decline theirs, or unfriend. Optional body
+// { intent: 'cancel' | 'decline' | 'unfriend' } makes the request fail with 409 unless the relation
+// still matches (so a stale "Cancel request" button can't unfriend someone who has since accepted).
+// Declining keeps the row as 'declined', so the requester can't ask again straight away; the other
+// two delete it. 404 if there was nothing to remove. Blocks are removed with DELETE /api/blocks.
 const DELETE_INTENTS = { cancel: 'outgoing', decline: 'incoming', unfriend: 'friends' };
 app.delete('/api/friends/:username', requireAuth, (req, res) => {
   const intent = intentOf(req);
   if (intent && !DELETE_INTENTS[intent]) {
     return res.status(400).json({ error: "intent must be 'cancel', 'decline' or 'unfriend'" });
   }
-  const other = findUser(req.params.username);
-  if (!other) return res.status(404).json({ error: 'User not found' });
-  const rel = relation(req.user.id, other.id);
+  const found = visibleUser(req, res);
+  if (!found) return;
+  const { user: other, rel } = found;
   if (rel === 'self') return res.status(400).json({ error: "You can't unfriend yourself" });
-  if (rel === 'none') return res.status(404).json({ error: 'No friendship or request to remove', relation: rel });
-  if (intent && DELETE_INTENTS[intent] !== rel) {
+  if (rel === 'none' || rel === 'declined') {
+    return res.status(404).json({ error: 'No friendship or request to remove', relation: rel });
+  }
+  if (rel === 'blocked' || (intent && DELETE_INTENTS[intent] !== rel)) {
     return res.status(409).json({ error: 'That friendship has changed. Refresh and try again.', relation: rel });
   }
-  db.prepare(`
-    DELETE FROM friendships
-    WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)
-  `).run(req.user.id, other.id, other.id, req.user.id);
+  if (rel === 'incoming') {
+    db.prepare("UPDATE friendships SET status = 'declined', responded_at = ? WHERE requester_id = ? AND addressee_id = ?")
+      .run(new Date().toISOString(), other.id, req.user.id);
+    return res.json({ relation: 'none', result: 'declined' });
+  }
+  deleteFriendship(req.user.id, other.id);
   res.json({ relation: 'none', result: 'removed' });
+});
+
+// Block a user: ends any friendship or request between you, and from then on they can't see your
+// profile, find you in searches or send you requests (to them it looks like you don't exist).
+// 201 when blocked, 200 if you had already blocked them.
+app.post('/api/blocks/:username', requireAuth, blockLimiter, (req, res) => {
+  const found = visibleUser(req, res);
+  if (!found) return;
+  const { user: other, rel } = found;
+  if (rel === 'self') return res.status(400).json({ error: "You can't block yourself" });
+  if (rel === 'blocked') return res.json({ relation: 'blocked', result: 'unchanged' });
+  transaction(() => {
+    deleteFriendship(req.user.id, other.id);
+    db.prepare("INSERT INTO friendships (requester_id, addressee_id, status, created_at) VALUES (?, ?, 'blocked', ?)")
+      .run(req.user.id, other.id, new Date().toISOString());
+  });
+  res.status(201).json({ relation: 'blocked', result: 'blocked' });
+});
+
+// Unblock a user. 404 if you hadn't blocked them.
+app.delete('/api/blocks/:username', requireAuth, (req, res) => {
+  const found = visibleUser(req, res);
+  if (!found) return;
+  const { changes } = db.prepare(
+    "DELETE FROM friendships WHERE requester_id = ? AND addressee_id = ? AND status = 'blocked'"
+  ).run(req.user.id, found.user.id);
+  if (!changes) return res.status(404).json({ error: `You haven't blocked @${found.user.username}`, relation: found.rel });
+  res.json({ relation: 'none', result: 'unblocked' });
 });
 
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));

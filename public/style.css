@@ -133,6 +133,16 @@ button.secondary {
 
 button.danger { background: transparent; color: var(--danger); border-color: var(--border); }
 
+a.button {
+  display: inline-block;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 7px 16px;
+  color: var(--text);
+}
+a.button:hover { text-decoration: none; }
+
 button.link {
   background: none;
   border: none;
@@ -152,6 +162,10 @@ button.link {
 .auth h1 { text-align: center; font-size: 2rem; }
 .auth form { display: grid; gap: 10px; }
 .auth .switch { text-align: center; margin-top: 14px; }
+
+.privacy-notice { font-size: 0.85rem; margin-top: 14px; }
+.privacy-notice p { margin: 0 0 6px; }
+.card > .privacy-notice { margin-top: 0; }
 
 /* ---------- Compose ---------- */
 
@@ -186,6 +200,12 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 
 .profile-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .profile-head h1 { margin: 0; }
+.profile-head .actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
+
+/* ---------- Account ---------- */
+
+.account-delete { display: grid; gap: 10px; }
+.account-delete button { justify-self: start; }
 
 .user-row {
   display: flex;
@@ -215,3 +235,4 @@ mark { background: #ffe66d; color: #16181c; border-radius: 2px; }
 
 .comment-form { display: flex; gap: 8px; margin-top: 8px; }
 .comment-form input { padding: 7px 10px; }
+.comment-note { margin: 6px 0 0; font-size: 0.8rem; }
